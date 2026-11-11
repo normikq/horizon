@@ -7,7 +7,7 @@ use horizon_client::{dynamic_light, gizmos};
 /// `RIM_EDGES_PER_MOD` outline edges. Requests bundles' injections push share one budget.
 pub(super) const RIMS_PER_MOD: usize = 256;
 pub(super) const RIM_EDGES_PER_MOD: usize = 4096;
-pub(super) const LIGHTS_PER_MOD: usize = 8;
+pub(super) const LIGHTS_PER_MOD: usize = 16;
 
 fn rim_target_valid(
     loaded: bool,
@@ -134,7 +134,7 @@ impl Game<'_> {
         close(l.at, player)
             && l.rgb <= 0xffffff
             && l.radius.is_finite()
-            && (0.25..=16.0).contains(&l.radius)
+            && (0.25..=64.0).contains(&l.radius)
             && l.intensity.is_finite()
             && (0.0..=1.0).contains(&l.intensity)
             && self.world.chunks.contains_key(&(

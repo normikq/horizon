@@ -68,6 +68,10 @@ pub struct NativeVideoState {
     /// videos' frames, and staging their pixels for the GPU.
     pub pump_micros: u64,
     pub upload_micros: u64,
+    /// Average RGB color of the current frame, for ambient dynamic lighting.
+    pub color: Option<[u8; 3]>,
+    /// Left, center and right zone average colors of the current frame.
+    pub colors: Option<[[u8; 3]; 3]>,
 }
 
 /// A patch this large is a video frame or a mod's image, not a glyph or a map.

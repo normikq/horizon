@@ -532,6 +532,14 @@ impl Game<'_> {
     pub(super) fn native_is_key_down(&self, key: KeyCode) -> bool {
         self.physical_keys.contains(&key)
     }
+    /// Whether the right mouse button (use / interact) is currently held down.
+    pub(super) fn native_has_right_down(&self) -> bool {
+        self.right
+    }
+    /// Whether the left mouse button (attack / break) is currently held down.
+    pub(super) fn native_has_left_down(&self) -> bool {
+        self.left
+    }
 }
 
 #[cfg(test)]

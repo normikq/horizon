@@ -116,7 +116,9 @@ fn native_colored_light(pos: vec3<f32>) -> vec3<f32> {
     for (var i = 0u; i < min(globals.colored_count.x, 16u); i++) {
         let at = globals.colored_lights[i * 2u];
         let color = globals.colored_lights[i * 2u + 1u];
-        rgb += color.rgb * max(0.0, 1.0 - distance(pos, at.xyz) / at.w) * color.a;
+        let atten = max(0.0, 1.0 - distance(pos, at.xyz) / at.w);
+        let smooth_atten = atten * atten * (3.0 - 2.0 * atten);
+        rgb += color.rgb * smooth_atten * color.a;
     }
     return min(rgb, vec3(1.0));
 }

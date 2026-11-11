@@ -16,6 +16,7 @@
 //! `render.h`, version 2); no mpv code is part of this crate.
 
 pub mod library;
+mod audio_pipe;
 mod player;
 mod sys;
 

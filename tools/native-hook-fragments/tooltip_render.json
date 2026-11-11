@@ -36,6 +36,14 @@
     {
       "name": "is_key_down",
       "target": "horizon_client::game::native_client_services::Game<'_>::native_is_key_down"
+    },
+    {
+      "name": "has_right_down",
+      "target": "horizon_client::game::native_client_services::Game<'_>::native_has_right_down"
+    },
+    {
+      "name": "has_left_down",
+      "target": "horizon_client::game::native_client_services::Game<'_>::native_has_left_down"
     }
   ],
   "rust_summary": "item tooltip rendering interception (`native_tooltip_render_pre`), GUI item drawing helpers (`gui_draw_item`, `gui_draw_item_with`), and live keyboard modifier/key state checks (`has_shift_down`, `has_control_down`, `has_alt_down`, `is_key_down`).",

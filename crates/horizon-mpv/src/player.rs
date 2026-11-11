@@ -9,7 +9,7 @@ use crate::Error;
 use crate::sys::{self, Api};
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -25,6 +25,9 @@ pub struct Options {
     pub muted: bool,
     /// 0 to 100.
     pub volume: u8,
+    /// When true, audio is captured to an internal PCM ring buffer instead of
+    /// playing directly to the system audio device (e.g. WASAPI).
+    pub capture_audio: bool,
 }
 
 impl Default for Options {
@@ -33,6 +36,7 @@ impl Default for Options {
             looped: false,
             muted: false,
             volume: 100,
+            capture_audio: false,
         }
     }
 }
@@ -107,6 +111,11 @@ struct Shared {
     ended: AtomicBool,
     loaded: AtomicBool,
     failed: AtomicBool,
+    /// Dominant/average RGB of the newest frame: `(r << 16) | (g << 8) | b`.
+    color: AtomicU32,
+    color_left: AtomicU32,
+    color_center: AtomicU32,
+    color_right: AtomicU32,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -163,6 +172,7 @@ pub struct Player {
     handle: *mut sys::Handle,
     shared: Arc<Shared>,
     thread: Option<std::thread::JoinHandle<()>>,
+    audio_pipe: Option<crate::audio_pipe::AudioPipe>,
     width: u32,
     height: u32,
 }
@@ -190,28 +200,41 @@ impl Player {
                 (api.mpv_terminate_destroy)(handle);
                 error
             };
+            let audio_pipe = if options.capture_audio && !options.muted {
+                Some(crate::audio_pipe::AudioPipe::new().map_err(fail)?)
+            } else {
+                None
+            };
             let volume = options.volume.min(100).to_string();
-            let settings: [(&CStr, &str); 15] = [
+            let mut settings: Vec<(&CStr, String)> = vec![
                 // Frames go to the render API, never to a window of mpv's own.
-                (c"vo", "libmpv"),
+                (c"vo", "libmpv".into()),
                 // Nothing of the player's mpv setup, no scripts, no downloader.
-                (c"config", "no"),
-                (c"load-scripts", "no"),
-                (c"ytdl", "no"),
-                (c"osc", "no"),
-                (c"terminal", "no"),
-                (c"input-default-bindings", "no"),
-                (c"input-vo-keyboard", "no"),
-                (c"load-unsafe-playlists", "no"),
+                (c"config", "no".into()),
+                (c"load-scripts", "no".into()),
+                (c"ytdl", "no".into()),
+                (c"osc", "no".into()),
+                (c"terminal", "no".into()),
+                (c"input-default-bindings", "no".into()),
+                (c"input-vo-keyboard", "no".into()),
+                (c"load-unsafe-playlists", "no".into()),
                 // Decoded on mpv's threads; the software renderer takes system memory.
-                (c"hwdec", "no"),
-                (c"idle", "yes"),
+                (c"hwdec", "no".into()),
+                (c"idle", "yes".into()),
                 // The last frame stays up at the end (`ended`).
-                (c"keep-open", "yes"),
-                (c"loop-file", if options.looped { "inf" } else { "no" }),
-                (c"audio", if options.muted { "no" } else { "auto" }),
-                (c"volume", &volume),
+                (c"keep-open", "yes".into()),
+                (c"loop-file", if options.looped { "inf".into() } else { "no".into() }),
+                (c"audio", if options.muted { "no".into() } else { "auto".into() }),
+                (c"volume", volume),
             ];
+            if let Some(pipe) = &audio_pipe {
+                settings.push((c"ao", "pcm".into()));
+                settings.push((c"ao-pcm-file", pipe.path.clone()));
+                settings.push((c"ao-pcm-waveheader", "no".into()));
+                settings.push((c"audio-format", "float".into()));
+                settings.push((c"audio-channels", "7.1".into()));
+                settings.push((c"audio-samplerate", "48000".into()));
+            }
             for (name, value) in settings {
                 let value = CString::new(value).unwrap_or_default();
                 let code = (api.mpv_set_option_string)(handle, name.as_ptr(), value.as_ptr());
@@ -233,6 +256,10 @@ impl Player {
                 ended: AtomicBool::new(false),
                 loaded: AtomicBool::new(false),
                 failed: AtomicBool::new(false),
+                color: AtomicU32::new(0),
+                color_left: AtomicU32::new(0),
+                color_center: AtomicU32::new(0),
+                color_right: AtomicU32::new(0),
             });
             let context = Arc::as_ptr(&shared) as *mut c_void;
             (api.mpv_set_wakeup_callback)(handle, Some(woken), context);
@@ -284,6 +311,7 @@ impl Player {
                 handle,
                 shared,
                 thread: Some(thread),
+                audio_pipe,
                 width,
                 height,
             })
@@ -330,6 +358,11 @@ impl Player {
     pub fn seek(&self, seconds: f64) -> Result<(), Error> {
         if !seconds.is_finite() || seconds < 0.0 {
             return Err(Error::Mpv("seek", format!("{seconds} is not a time")));
+        }
+        if let Some(pipe) = &self.audio_pipe {
+            if let Ok(mut lock) = pipe.buffer.lock() {
+                lock.clear();
+            }
         }
         self.command(&["seek", &format!("{seconds:.3}"), "absolute"])
     }
@@ -399,6 +432,91 @@ impl Player {
         lock(&self.shared.frame).take()
     }
 
+    /// The average RGB color ([r, g, b] in 0..=255) of the newest frame rendered so far,
+    /// or None if no frame has been rendered yet.
+    pub fn frame_color(&self) -> Option<[u8; 3]> {
+        if self.shared.frames.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let rgb = self.shared.color.load(Ordering::Relaxed);
+        Some([((rgb >> 16) & 0xff) as u8, ((rgb >> 8) & 0xff) as u8, (rgb & 0xff) as u8])
+    }
+
+    /// Left, center and right zone average RGB colors of the newest frame rendered so far,
+    /// or None if no frame has been rendered yet.
+    pub fn frame_colors(&self) -> Option<[[u8; 3]; 3]> {
+        if self.shared.frames.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let unpack = |val: u32| [((val >> 16) & 0xff) as u8, ((val >> 8) & 0xff) as u8, (val & 0xff) as u8];
+        Some([
+            unpack(self.shared.color_left.load(Ordering::Relaxed)),
+            unpack(self.shared.color_center.load(Ordering::Relaxed)),
+            unpack(self.shared.color_right.load(Ordering::Relaxed)),
+        ])
+    }
+
+    /// Takes up to `max_samples` mono audio samples (downmixed from stereo, -1.0..=1.0)
+    /// captured from mpv's audio stream, resynced against video playback position.
+    pub fn take_audio(&self, max_samples: usize) -> Option<Vec<f32>> {
+        let pipe = self.audio_pipe.as_ref()?;
+        let mut lock = pipe.buffer.lock().ok()?;
+        if let Some(pos) = self.position() {
+            lock.resync(pos, 48000);
+        }
+        let samples = lock.take_mono(max_samples);
+        if samples.is_empty() {
+            None
+        } else {
+            Some(samples)
+        }
+    }
+
+    /// Takes up to `max_samples` stereo (left, right) audio samples.
+    pub fn take_audio_stereo(&self, max_samples: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        let pipe = self.audio_pipe.as_ref()?;
+        let mut lock = pipe.buffer.lock().ok()?;
+        if let Some(pos) = self.position() {
+            lock.resync(pos, 48000);
+        }
+        let (left, right) = lock.take_stereo(max_samples);
+        if left.is_empty() && right.is_empty() {
+            None
+        } else {
+            Some((left, right))
+        }
+    }
+
+    /// Takes up to `max_samples` 5.1 surround channels [FL, FR, FC, LFE, SL, SR].
+    pub fn take_audio_51(&self, max_samples: usize) -> Option<[Vec<f32>; 6]> {
+        let pipe = self.audio_pipe.as_ref()?;
+        let mut lock = pipe.buffer.lock().ok()?;
+        if let Some(pos) = self.position() {
+            lock.resync(pos, 48000);
+        }
+        let channels = lock.take_51(max_samples);
+        if channels[0].is_empty() {
+            None
+        } else {
+            Some(channels)
+        }
+    }
+
+    /// Takes up to `max_samples` 7.1 surround channels [FL, FR, FC, LFE, BL, BR, SL, SR].
+    pub fn take_audio_71(&self, max_samples: usize) -> Option<[Vec<f32>; 8]> {
+        let pipe = self.audio_pipe.as_ref()?;
+        let mut lock = pipe.buffer.lock().ok()?;
+        if let Some(pos) = self.position() {
+            lock.resync(pos, 48000);
+        }
+        let channels = lock.take_71(max_samples);
+        if channels[0].is_empty() {
+            None
+        } else {
+            Some(channels)
+        }
+    }
+
     pub fn stats(&self) -> Stats {
         Stats {
             frames: self.shared.frames.load(Ordering::Relaxed),
@@ -457,6 +575,11 @@ fn run(core: Core, shared: &Shared, width: u32, height: u32) {
                     Ordering::Relaxed,
                 );
                 shared.frames.fetch_add(1, Ordering::Relaxed);
+                let (avg, left, center, right) = calculate_frame_colors(&frame, width, height);
+                shared.color.store(avg, Ordering::Relaxed);
+                shared.color_left.store(left, Ordering::Relaxed);
+                shared.color_center.store(center, Ordering::Relaxed);
+                shared.color_right.store(right, Ordering::Relaxed);
                 *lock(&shared.frame) = Some(frame);
             }
         }
@@ -516,6 +639,95 @@ fn render_frame(
         pixel[3] = 0xff;
     }
     Some(pixels)
+}
+
+/// Analyzes a 16x16 grid of samples across the frame to determine the dominant/average
+/// color overall and across left/center/right zones.
+/// Returns `(overall_rgb, left_rgb, center_rgb, right_rgb)` packed as `(r << 16) | (g << 8) | b`.
+fn calculate_frame_colors(pixels: &[u8], width: u32, height: u32) -> (u32, u32, u32, u32) {
+    if width == 0 || height == 0 || pixels.len() < (width * height * 4) as usize {
+        return (0, 0, 0, 0);
+    }
+    const SAMPLES_X: u32 = 16;
+    const SAMPLES_Y: u32 = 16;
+    let sx = SAMPLES_X.min(width);
+    let sy = SAMPLES_Y.min(height);
+    let step_x = width as f32 / sx as f32;
+    let step_y = height as f32 / sy as f32;
+
+    let mut sum_r: u64 = 0;
+    let mut sum_g: u64 = 0;
+    let mut sum_b: u64 = 0;
+    let mut count: u64 = 0;
+
+    let mut left_r: u64 = 0;
+    let mut left_g: u64 = 0;
+    let mut left_b: u64 = 0;
+    let mut left_count: u64 = 0;
+
+    let mut center_r: u64 = 0;
+    let mut center_g: u64 = 0;
+    let mut center_b: u64 = 0;
+    let mut center_count: u64 = 0;
+
+    let mut right_r: u64 = 0;
+    let mut right_g: u64 = 0;
+    let mut right_b: u64 = 0;
+    let mut right_count: u64 = 0;
+
+    let left_boundary = sx / 3;
+    let right_boundary = (sx * 2) / 3;
+
+    for iy in 0..sy {
+        let py = ((iy as f32 + 0.5) * step_y) as u32;
+        let row_offset = (py.min(height - 1) * width) as usize * 4;
+        for ix in 0..sx {
+            let px = ((ix as f32 + 0.5) * step_x) as u32;
+            let offset = row_offset + px.min(width - 1) as usize * 4;
+            if offset + 2 < pixels.len() {
+                let r = pixels[offset] as u64;
+                let g = pixels[offset + 1] as u64;
+                let b = pixels[offset + 2] as u64;
+
+                sum_r += r;
+                sum_g += g;
+                sum_b += b;
+                count += 1;
+
+                if ix < left_boundary {
+                    left_r += r;
+                    left_g += g;
+                    left_b += b;
+                    left_count += 1;
+                } else if ix < right_boundary {
+                    center_r += r;
+                    center_g += g;
+                    center_b += b;
+                    center_count += 1;
+                } else {
+                    right_r += r;
+                    right_g += g;
+                    right_b += b;
+                    right_count += 1;
+                }
+            }
+        }
+    }
+
+    let pack = |r: u64, g: u64, b: u64, c: u64| -> u32 {
+        if c == 0 {
+            0
+        } else {
+            (((r / c) as u32) << 16) | (((g / c) as u32) << 8) | ((b / c) as u32)
+        }
+    };
+
+    (
+        pack(sum_r, sum_g, sum_b, count),
+        pack(left_r, left_g, left_b, left_count),
+        pack(center_r, center_g, center_b, center_count),
+        pack(right_r, right_g, right_b, right_count),
+    )
 }
 
 /// Takes mpv's waiting events into `shared`.
@@ -685,5 +897,57 @@ mod tests {
         assert!(local_name(&name), "{name}");
         assert!(!name.starts_with(r"\\?\"));
         let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn calculate_frame_colors_detects_uniform_and_zoned_colors() {
+        // 1. Uniform orange explosion
+        let width = 64;
+        let height = 36;
+        let mut pixels = vec![0u8; width * height * 4];
+        for chunk in pixels.chunks_exact_mut(4) {
+            chunk[0] = 255;
+            chunk[1] = 128;
+            chunk[2] = 0;
+            chunk[3] = 255;
+        }
+        let (avg, left, center, right) = calculate_frame_colors(&pixels, width as u32, height as u32);
+        assert_eq!(avg, (255 << 16) | (128 << 8));
+        assert_eq!(left, (255 << 16) | (128 << 8));
+        assert_eq!(center, (255 << 16) | (128 << 8));
+        assert_eq!(right, (255 << 16) | (128 << 8));
+
+        // 2. Left side ocean blue, right side sunset orange
+        for y in 0..height {
+            for x in 0..width {
+                let idx = (y * width + x) * 4;
+                if x < width / 3 {
+                    // Left: ocean blue (0, 150, 255)
+                    pixels[idx] = 0;
+                    pixels[idx + 1] = 150;
+                    pixels[idx + 2] = 255;
+                } else if x >= (width * 2) / 3 {
+                    // Right: sunset orange (255, 100, 20)
+                    pixels[idx] = 255;
+                    pixels[idx + 1] = 100;
+                    pixels[idx + 2] = 20;
+                } else {
+                    // Center: dark (0, 0, 0)
+                    pixels[idx] = 0;
+                    pixels[idx + 1] = 0;
+                    pixels[idx + 2] = 0;
+                }
+            }
+        }
+        let (_, left, center, right) = calculate_frame_colors(&pixels, width as u32, height as u32);
+        assert_eq!((left >> 16) & 0xff, 0);
+        assert_eq!((left >> 8) & 0xff, 150);
+        assert_eq!(left & 0xff, 255);
+
+        assert_eq!(center, 0);
+
+        assert_eq!((right >> 16) & 0xff, 255);
+        assert_eq!((right >> 8) & 0xff, 100);
+        assert_eq!(right & 0xff, 20);
     }
 }

@@ -104,6 +104,7 @@ impl Game<'_> {
         }
         let options = Options {
             looped,
+            capture_audio: true,
             ..Options::default()
         };
         let player = self
@@ -181,7 +182,57 @@ impl Game<'_> {
             render_micros: stats.render_micros,
             pump_micros: self.extras.videos.pump_micros,
             upload_micros: upload_micros(),
+            color: if v.shown { v.player.frame_color() } else { None },
+            colors: if v.shown { v.player.frame_colors() } else { None },
         })
+    }
+
+    /// The average RGB color ([r, g, b] in 0..=255) of `video`'s current frame,
+    /// or None if no frame is shown. Useful for ambient dynamic room lighting.
+    /// API @API:world_video@.
+    pub(in crate::game) fn native_video_color(&self, video: u32) -> Option<[u8; 3]> {
+        let v = self.video(video).filter(|v| v.shown)?;
+        v.player.frame_color()
+    }
+
+    /// Left, center and right zone average RGB colors of `video`'s current frame.
+    /// Useful for multi-zone dynamic ambient lighting on wide or curved screens.
+    /// API @API:world_video@.
+    pub(in crate::game) fn native_video_colors(&self, video: u32) -> Option<[[u8; 3]; 3]> {
+        let v = self.video(video).filter(|v| v.shown)?;
+        v.player.frame_colors()
+    }
+
+    /// Takes up to `max_samples` mono audio samples (downmixed from stereo, -1.0..=1.0)
+    /// captured from `video`'s current audio stream, resynchronized against the video playback.
+    /// Can be fed into `host.push_voice(...)` with the screen's coordinates to achieve
+    /// full 3D positional audio and distance attenuation through Horizon's audio engine.
+    /// API @API:world_video@.
+    pub(in crate::game) fn native_video_audio(&mut self, video: u32, max_samples: u32) -> Option<Vec<f32>> {
+        let v = self.video(video)?;
+        v.player.take_audio(max_samples as usize)
+    }
+
+    /// Takes up to `max_samples` stereo (left, right) audio samples from `video`.
+    /// Useful for placing separate left and right 3D speakers across wide cinema screens.
+    /// API @API:world_video@.
+    pub(in crate::game) fn native_video_audio_stereo(&mut self, video: u32, max_samples: u32) -> Option<(Vec<f32>, Vec<f32>)> {
+        let v = self.video(video)?;
+        v.player.take_audio_stereo(max_samples as usize)
+    }
+
+    /// Takes up to `max_samples` 5.1 surround audio channels [FL, FR, FC, LFE, SL, SR] from `video`.
+    /// API @API:world_video@.
+    pub(in crate::game) fn native_video_audio_51(&mut self, video: u32, max_samples: u32) -> Option<[Vec<f32>; 6]> {
+        let v = self.video(video)?;
+        v.player.take_audio_51(max_samples as usize)
+    }
+
+    /// Takes up to `max_samples` 7.1 surround audio channels [FL, FR, FC, LFE, BL, BR, SL, SR] from `video`.
+    /// API @API:world_video@.
+    pub(in crate::game) fn native_video_audio_71(&mut self, video: u32, max_samples: u32) -> Option<[Vec<f32>; 8]> {
+        let v = self.video(video)?;
+        v.player.take_audio_71(max_samples as usize)
     }
 
     /// Draws `video`'s current frame on a quad with `corners` in blocks under
