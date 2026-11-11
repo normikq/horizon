@@ -1171,6 +1171,7 @@ pub trait HostTaskExt: Host {
 impl<H: Host + ?Sized> HostTaskExt for H {}
 
 pub use crate::game::native_client_services::HudMode;
+pub use crate::video_slots::NativeVideoState;
 
 /// Result of accessing or decoding an attachment.
 pub type AttachmentResult<T> = std::result::Result<T, AttachmentError>;

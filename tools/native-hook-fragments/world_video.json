@@ -1,0 +1,18 @@
+{
+  "hooks": [],
+  "helpers": [
+    {"name": "video_open", "target": "horizon_client::game::extras::video::Game<'_>::native_video_open"},
+    {"name": "video_load", "target": "horizon_client::game::extras::video::Game<'_>::native_video_load"},
+    {"name": "video_pause", "target": "horizon_client::game::extras::video::Game<'_>::native_video_pause"},
+    {"name": "video_seek", "target": "horizon_client::game::extras::video::Game<'_>::native_video_seek"},
+    {"name": "video_volume", "target": "horizon_client::game::extras::video::Game<'_>::native_video_volume"},
+    {"name": "video_close", "target": "horizon_client::game::extras::video::Game<'_>::native_video_close"},
+    {"name": "video_state", "target": "horizon_client::game::extras::video::Game<'_>::native_video_state"},
+    {"name": "draw_video", "target": "horizon_client::game::extras::video::Game<'_>::native_draw_video"}
+  ],
+  "rust_summary": "video on a surface in the world, played by a libmpv the mod declares (`native_video_open`, `native_draw_video`).",
+  "doc_summary": "video in the world (docs/native-libraries.md): `native_video_open(path, width, height, looped)` plays a local file with the libmpv the mod declared in `native-libraries.toml` and returns a surface, `native_draw_video(draw, video, corners)` draws its current frame on a quad from `native_block_entity_submit`, and `native_video_load`, `native_video_pause`, `native_video_seek`, `native_video_volume`, `native_video_close` and `native_video_state` drive and read it. mpv plays the sound itself. Bundles need \"hooks\": @API:world_video@.",
+  "comments": [
+    "crates/horizon-client/src/game/extras/video.rs"
+  ]
+}

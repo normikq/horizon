@@ -614,6 +614,13 @@ game, so it works from any hook, and makes the folder when missing. A mod that l
 when edited (`native_config_loading`, `native_config_reloading`, as NeoForge's `ModConfigEvent`), and a world can
 keep its own server config in `serverconfig/` ([native-mods.md](native-mods.md)). Settings kept with `native_set_setting` stay where they were, in `horizon-mods/.horizon-mod-data/<id>/`.
 
+A native mod can also bring a third-party library that the game loads at run time. It declares the file and its
+SHA-256 in `native-libraries.toml`; the launcher checks the hash, installs the file beside the built game, and
+never downloads it. The first such library is libmpv, for video on a surface in the world: `native_video_open`
+plays a local file, `native_draw_video` draws its frames on a quad, and `native_video_pause`, `native_video_seek`,
+`native_video_volume` and `native_video_close` drive it. mpv plays the sound itself, outside the game's mixer.
+The format, the checks, the helpers and what a frame costs: [native-libraries.md](native-libraries.md).
+
 ## Publish your mod
 
 Horizon's registry lists mods, modpacks (`.hpack`) and resource packs made for Horizon. **A project is reviewed

@@ -22,4 +22,13 @@ fn main() {
         println!("cargo:rustc-env=HORIZON_MIXIN_MODS={}", staged.join(","));
     }
     windows_exe::resources("horizon-client");
+    // An example that runs the whole game (`examples/video_screen.rs`) needs the game's stack
+    // too: Windows gives a main thread 1 MB, which building a `Game` overflows.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        let arg = match std::env::var("CARGO_CFG_TARGET_ENV").as_deref() {
+            Ok("msvc") => "/STACK:8388608",
+            _ => "-Wl,--stack,8388608",
+        };
+        println!("cargo:rustc-link-arg-examples={arg}");
+    }
 }

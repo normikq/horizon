@@ -1455,6 +1455,7 @@ dependencies = [
  "horizon-items",
  "horizon-mod-api-gen",
  "horizon-mods",
+ "horizon-mpv",
  "horizon-narrator",
  "horizon-optifine",
  "horizon-protocol",
@@ -1784,6 +1785,17 @@ dependencies = [
  "toml",
  "wasmparser",
  "zip",
+]
+
+[[package]]
+name = "horizon-mpv"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "log",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]

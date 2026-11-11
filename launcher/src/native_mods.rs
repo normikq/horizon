@@ -33,6 +33,7 @@ mod diagnostics;
 mod inject;
 mod inject_cache;
 mod isolate;
+mod libraries;
 mod source;
 
 use source::{
@@ -2266,6 +2267,12 @@ fn pipeline(
             .collect::<Result<_, String>>()?,
     };
     let exists = target.directory(&version).join(".installed").is_file();
+    // Before anything compiles: a library that is missing or not the declared file stops here.
+    let libraries = libraries::wanted(
+        &mods,
+        libraries::platform(platform.target),
+        &root().join(libraries::SUPPLIED),
+    )?;
     let plan = classify(
         exists,
         last_record(target, profile, platform.cache_key()).as_ref(),
@@ -2475,9 +2482,11 @@ fn pipeline(
                 "sha256": digests.get(&m.id).cloned().flatten(),
             })).collect::<Vec<_>>(),
             "left_out": left_out.iter().map(LeftOut::to_json).collect::<Vec<_>>(),
+            "libraries": libraries::about(&libraries),
         });
         install(base, &version, target, &binary, &about, |dir| {
             install_content(&mods, dir)?;
+            libraries::install(&libraries, dir)?;
             for (step, program) in &post {
                 progress(Step::PostBuild(step.mod_id.clone()));
                 let cmd = crates::post_build(program, step, dir, &real.join("cache"), &stage)?;
@@ -2868,6 +2877,8 @@ fn carried_over(name: &std::ffi::OsStr, target: Target) -> bool {
         "native-mods.json",
         "native-data",
         "native-content",
+        libraries::DIR,
+        libraries::INSTALLED,
     ]
     .iter()
     .map(|s| s.to_string())

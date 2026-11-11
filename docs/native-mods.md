@@ -2128,6 +2128,10 @@ each was built or last used): switching a mod off and on again plays the kept bu
   logs (the default Horizon instance's, when they are installed there); other instances play their own versions.
 - What this does not do: sandbox the compiled game. horizon-mixins' checks stop mistakes, not a malicious helper
   ([security notes](https://github.com/horizon-rust/horizon-mixins/blob/main/docs/security.md)).
+- **Third-party libraries.** A bundle may declare a library the game loads at run time, such as libmpv
+  (`native-libraries.toml`). The launcher installs only a file with the declared SHA-256, from the bundle or from
+  the player's own folder, and never downloads one; the game checks the hash again before loading it by its full
+  path ([native-libraries.md](native-libraries.md)). The library runs with the same rights as the mod.
 
 ## Multiplayer
 

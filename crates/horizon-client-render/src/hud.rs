@@ -918,14 +918,9 @@ impl HudAtlas {
             crate::minimap::SIZE as u32,
             Vec::new(),
         ));
-        // A mod's own image (native `mod_image`), only when a mod is loaded.
+        // A mod's own image and video (`video_slots`), only when a mod is loaded.
         if mod_image {
-            images.push((
-                MOD_IMAGE_SPRITE.into(),
-                MOD_IMAGE_SIZE,
-                MOD_IMAGE_SIZE,
-                Vec::new(),
-            ));
+            crate::video_slots::mod_slots(images);
         }
         // Downloaded skins (game/scoreboard.rs).
         for i in 0..SKIN_SLOTS {
@@ -2885,6 +2880,7 @@ impl HudRenderer {
         patches: &[crate::font::Patch],
     ) {
         if let Some(texture) = &self.atlas_texture {
+            let started = std::time::Instant::now();
             for p in patches {
                 if p.x.saturating_add(p.width) <= texture.width()
                     && p.y.saturating_add(p.height) <= texture.height()
@@ -2907,6 +2903,7 @@ impl HudRenderer {
                     );
                 }
             }
+            crate::video_slots::uploaded(patches, started);
         }
     }
     /// Stage the batch's atlas patches, vertices and uniform: before the

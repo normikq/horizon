@@ -50,6 +50,8 @@ members = [
     "crates/horizon-shader-api",
     "crates/horizon-release-sign",
     "crates/horizon-mod-deps",
+    # libmpv, opened at run time from the version folder (docs/native-libraries.md).
+    "crates/horizon-mpv",
     "xtask",
 ]
 resolver = "2"

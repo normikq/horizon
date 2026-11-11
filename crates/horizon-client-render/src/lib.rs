@@ -148,6 +148,7 @@ pub mod touch;
 pub mod trims;
 pub mod ui;
 pub mod vault;
+pub mod video_slots;
 pub mod weather;
 pub mod widgets;
 pub mod world;

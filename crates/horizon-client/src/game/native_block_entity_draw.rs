@@ -281,6 +281,26 @@ impl BlockEntityDraw {
             });
         }
     }
+
+    /// A quad that shows its texture as it is, whatever the light on the
+    /// block and the side it faces: a screen (`native_draw_video`).
+    pub(super) fn bright_quad(&mut self, corners: [[f32; 3]; 4], uv: [[f32; 2]; 4], sprite: Rect) {
+        let pose = self.pose();
+        for (corner, uv) in corners.into_iter().zip(uv) {
+            self.vertices.push(Vertex {
+                pos: pose.transform_point3(Vec3::from_array(corner)).to_array(),
+                uv: [
+                    sprite.u0 + (sprite.u1 - sprite.u0) * uv[0],
+                    sprite.v0 + (sprite.v1 - sprite.v0) * uv[1],
+                ],
+                layer: 0,
+                color: u32::MAX,
+                light: 240 | 240 << 8,
+                normal: [0; 4],
+                glint_uv: [0.0, 0.0],
+            });
+        }
+    }
 }
 
 /// One face of a `native_draw_cube` box: its sprite (`mymod:entity/cog`,

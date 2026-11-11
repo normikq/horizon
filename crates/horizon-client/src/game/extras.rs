@@ -15,6 +15,8 @@ use horizon_client::{
 use std::time::Duration;
 use winit::event::MouseButton;
 
+mod video;
+
 #[derive(Default)]
 pub(super) struct ExtrasState {
     fps: FpsCounter,
@@ -26,6 +28,8 @@ pub(super) struct ExtrasState {
     minimap_dim: Option<Dim>,
     /// Auto-reconnect's attempts at the current server.
     reconnect: Tracker,
+    /// The videos native mods play in the world (`native_video_open`).
+    videos: video::Videos,
 }
 /// CPU time the minimap's tiles may take per frame.
 const MINIMAP_BUDGET: Duration = Duration::from_micros(300);
@@ -58,6 +62,7 @@ impl Game<'_> {
             self.extras.mouse = [false; 2];
         }
         self.update_minimap();
+        self.videos_frame();
         // For mods (`render.frame-stats`, `native_frame_rate`).
         let now = self.extras_now();
         self.extras.fps.record(now, elapsed.as_secs_f32() * 1000.0);

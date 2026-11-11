@@ -41,6 +41,9 @@ horizon-shaders = { path = "../horizon-shaders" }
 horizon-shader-api = { path = "../horizon-shader-api" }
 # Play with Friends: invite codes and their tunnel; the `friends` feature.
 horizon-friends = { path = "../horizon-friends", optional = true }
+# libmpv for the video native mods play in the world, opened at run time from the version
+# folder and only when a mod asks (docs/native-libraries.md).
+horizon-mpv = { path = "../horizon-mpv" }
 # The narrator (GameNarrator): text-to-speech of chat, system messages and screens.
 horizon-narrator = { path = "../horizon-narrator" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
@@ -163,6 +166,11 @@ path = "examples/native_gui_overlay_probe.rs"
 [[example]]
 name = "wind_burst_hook_probe"
 path = "examples/wind_burst_hook_probe.rs"
+
+# A video screen in the world, played by libmpv (docs/native-libraries.md).
+[[example]]
+name = "video_screen"
+path = "examples/video_screen.rs"
 
 [build-dependencies]
 horizon-mod-api-gen = { path = "../horizon-mod-api-gen" }
