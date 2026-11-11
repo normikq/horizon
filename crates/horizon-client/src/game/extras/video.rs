@@ -195,6 +195,19 @@ impl Game<'_> {
         video: u32,
         corners: [[f32; 3]; 4],
     ) -> bool {
+        self.native_draw_video_part(draw, video, corners, [0.0, 0.0, 1.0, 1.0])
+    }
+
+    /// Draws a sub-rectangle `uv` ([u0, v0, u1, v1] in 0.0..=1.0) of `video`'s current frame
+    /// on a quad with `corners` under `draw`'s pose. Allows drawing curved, cylindrical,
+    /// or multi-panel screen meshes. API @API:world_video@.
+    pub(in crate::game) fn native_draw_video_part(
+        &self,
+        draw: &mut BlockEntityDraw,
+        video: u32,
+        corners: [[f32; 3]; 4],
+        uv: [f32; 4],
+    ) -> bool {
         let Some(v) = self.video(video).filter(|v| v.shown) else {
             return false;
         };
@@ -203,7 +216,16 @@ impl Game<'_> {
             return false;
         };
         let (width, height) = v.player.size();
-        draw.bright_quad(corners, frame_uv(width, height), rect);
+        let [tl, bl, br, _tr] = frame_uv(width, height);
+        let du = br[0] - tl[0];
+        let dv = bl[1] - tl[1];
+        let slice_uv = [
+            [tl[0] + du * uv[0], tl[1] + dv * uv[1]],
+            [tl[0] + du * uv[0], tl[1] + dv * uv[3]],
+            [tl[0] + du * uv[2], tl[1] + dv * uv[3]],
+            [tl[0] + du * uv[2], tl[1] + dv * uv[1]],
+        ];
+        draw.bright_quad(corners, slice_uv, rect);
         true
     }
 
