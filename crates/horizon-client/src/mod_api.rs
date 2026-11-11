@@ -72,7 +72,7 @@ pub use crate::spans::Span as TickSpan;
 pub use crate::terrain_model::{
     NativeModelMaterial, NativeModelRenderOptions, NativeModelShade, NativeModelUvShift,
 };
-pub use crate::text::Text;
+pub use crate::text::{ClickEvent, Style, Text};
 pub use crate::world_primitives::{PrimitiveShape, WorldPrimitive, WorldPrimitives};
 pub use horizon_assets::item_model::{DisplayContext, StackView};
 pub use horizon_core::{
