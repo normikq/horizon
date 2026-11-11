@@ -86,10 +86,14 @@ impl Game<'_> {
     pub(in crate::game) fn native_video_open(
         &mut self,
         path: &str,
-        width: u32,
-        height: u32,
+        mut width: u32,
+        mut height: u32,
         looped: bool,
     ) -> Result<u32, String> {
+        if width == 0 || height == 0 {
+            width = VIDEO_WIDTH;
+            height = VIDEO_HEIGHT;
+        }
         if !fits(width, height) {
             return Err(format!(
                 "a video surface is at most {VIDEO_WIDTH}x{VIDEO_HEIGHT}, not {width}x{height}"
@@ -341,8 +345,8 @@ mod tests {
     fn a_frame_is_sampled_inside_its_own_pixels() {
         let [top_left, bottom_left, bottom_right, top_right] = frame_uv(640, 360);
         // Texel centres of the frame's first and last pixels, as slot fractions.
-        assert_eq!(top_left, [0.5 / 1280.0, 0.5 / 720.0]);
-        assert_eq!(bottom_right, [639.5 / 1280.0, 359.5 / 720.0]);
+        assert_eq!(top_left, [0.5 / VIDEO_WIDTH as f32, 0.5 / VIDEO_HEIGHT as f32]);
+        assert_eq!(bottom_right, [639.5 / VIDEO_WIDTH as f32, 359.5 / VIDEO_HEIGHT as f32]);
         assert_eq!(bottom_left, [top_left[0], bottom_right[1]]);
         assert_eq!(top_right, [bottom_right[0], top_left[1]]);
         // A full-size frame stays inside the slot.

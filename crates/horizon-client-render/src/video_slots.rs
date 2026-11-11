@@ -12,9 +12,9 @@ use std::time::Instant;
 
 /// How many videos play at once. Each slot costs 3.5 MiB of atlas.
 pub const VIDEO_SLOTS: usize = 2;
-/// A video frame's largest size: 720p.
-pub const VIDEO_WIDTH: u32 = 1280;
-pub const VIDEO_HEIGHT: u32 = 720;
+/// A video frame's largest size: 1080p (Full HD native).
+pub const VIDEO_WIDTH: u32 = 1920;
+pub const VIDEO_HEIGHT: u32 = 1080;
 
 /// The atlas sprite of video slot `slot` (`horizon/video{slot}`).
 pub fn video_slot_sprite(slot: usize) -> Option<&'static str> {

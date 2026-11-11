@@ -514,7 +514,7 @@ impl Default for VideoScreen {
 impl VideoScreen {
     fn open(&self, host: &mut dyn Host, state: &mut State, path: &str) -> Result<(), String> {
         let camera = host.camera().ok_or("no world is shown yet")?;
-        let video = host.video_open(path, 1280, 720, true)?;
+        let video = host.video_open(path, 1920, 1080, true)?;
         if let Some(old) = state.screen.take() {
             if let Some(v) = old.video {
                 host.video_close(v);
@@ -531,7 +531,7 @@ impl VideoScreen {
         saved: &SavedScreen,
         path: &str,
     ) -> Result<(), String> {
-        let video = host.video_open(path, 1280, 720, true)?;
+        let video = host.video_open(path, 1920, 1080, true)?;
         if let Some(old) = state.screen.take() {
             if let Some(v) = old.video {
                 host.video_close(v);
@@ -929,6 +929,21 @@ impl VideoScreen {
         let qz = ray_orig[2] + ray_dir[2] * t;
         let dist_sq = (point[0] - qx).powi(2) + (point[1] - qy).powi(2) + (point[2] - qz).powi(2);
         (dist_sq.sqrt(), t)
+    }
+
+    pub fn is_screen_visible(camera: &NativeCamera, screen_center: [f64; 3], screen_radius: f64) -> bool {
+        let dx = screen_center[0] - camera.position[0];
+        let dy = screen_center[1] - camera.position[1];
+        let dz = screen_center[2] - camera.position[2];
+        let dist_sq = dx * dx + dy * dy + dz * dz;
+        if dist_sq <= screen_radius * screen_radius {
+            return true;
+        }
+        let dist = dist_sq.sqrt();
+        let ray = Self::crosshair_ray(camera);
+        let dot = (dx * ray[0] + dy * ray[1] + dz * ray[2]) / dist;
+        let angular_radius = (screen_radius / dist).min(1.0);
+        dot + angular_radius >= 0.05
     }
 
     pub fn ray_intersect_screen_plane(
@@ -1883,6 +1898,14 @@ impl Hooks for VideoScreen {
         let state = self.0.lock().unwrap();
         let Some(screen) = &state.screen else { return };
         if let Some(video) = screen.video {
+            if let Some(camera) = host.camera() {
+                let (w, h) = screen.dimensions(screen.applied_native_size);
+                let center = [screen.at[0], screen.at[1] + h as f64 * 0.5, screen.at[2]];
+                let radius = (screen.diagonal as f64 * 0.6).max(w as f64 * 0.6);
+                if !Self::is_screen_visible(&camera, center, radius) {
+                    return;
+                }
+            }
             event.draw.push();
             if event.draw.translate_world(screen.at) {
                 if screen.curvature <= 0.5 {
@@ -2209,9 +2232,22 @@ impl Hooks for VideoScreen {
         };
         let screen_at = screen.at;
         let screen_yaw = screen.yaw;
-        let _screen_diagonal = screen.diagonal;
+        let screen_diagonal = screen.diagonal;
         let screen_curvature = screen.curvature;
         let (width, height) = screen.dimensions(screen.applied_native_size);
+
+        let Some(camera) = host.camera() else {
+            return;
+        };
+        let center = [
+            screen_at[0],
+            screen_at[1] + height as f64 * 0.5,
+            screen_at[2],
+        ];
+        let screen_radius = (screen_diagonal as f64 * 0.6).max(width as f64 * 0.6);
+        if !Self::is_screen_visible(&camera, center, screen_radius) {
+            return;
+        }
 
         let Some(color) = host.video_color(video) else {
             return;
@@ -2271,7 +2307,7 @@ impl Hooks for VideoScreen {
         let right = [-cos as f64, -sin as f64];
         let normal = [sin as f64, -cos as f64]; // Normal facing towards viewers/room
 
-        let forward_offset = (0.5_f64).max(width as f64 * 0.02).min(1.2_f64);
+        let forward_offset = (0.8_f64).max(width as f64 * 0.03).min(2.0_f64);
         let pack_rgb = |cr: f32, cg: f32, cb: f32| -> u32 {
             let r = (cr.round() as u32).min(255);
             let g = (cg.round() as u32).min(255);
@@ -2289,98 +2325,75 @@ impl Hooks for VideoScreen {
             pack_rgb(br / top * 255.0, bg / top * 255.0, bb / top * 255.0)
         };
 
-        // Screen area light simulation: distribute lights across the screen surface
-        // to produce a smooth, continuous, uniform ambient wash without localized hotspots.
-        let is_tall = height >= 3.0;
-        let n_cols: usize = if is_tall { 6 } else { 7 };
-        let rows: Vec<(f64, f32)> = if is_tall {
-            // Lower row near floor and upper row for ceiling/room depth
-            vec![
-                ((height as f64 * 0.10).max(0.4), 1.15),
-                (height as f64 * 0.60, 0.85),
-            ]
+        let center_y = screen_at[1] + height as f64 * 0.5;
+        let base_radius = (screen_diagonal * 1.5).max(width * 1.2).max(16.0).min(64.0);
+
+        // If screen is wide or curved, emit 3 directional lights across the screen for immersive surround ambiance
+        if (width > 6.0 || screen_curvature > 5.0) && zone_colors.is_some() {
+            let zones = zone_colors.unwrap();
+            let spread = (width as f64 * 0.3).min(6.0);
+            let side_radius = (base_radius * 0.85).clamp(4.0, 48.0);
+            let side_intensity = (intensity * 0.85).clamp(0.0, 1.0);
+
+            let tune_zone = |z: [u8; 3]| -> u32 {
+                tune_color(z[0] as f32, z[1] as f32, z[2] as f32)
+            };
+
+            // Left light
+            let left_pos = [
+                screen_at[0] - right[0] * spread + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] - right[1] * spread + normal[1] * forward_offset,
+            ];
+            let left_rgb = tune_zone(zones[0]);
+            event.lights.push(NativeColoredLight {
+                at: left_pos,
+                rgb: left_rgb,
+                radius: side_radius,
+                intensity: side_intensity,
+            });
+
+            // Center light
+            let center_pos = [
+                screen_at[0] + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] + normal[1] * forward_offset,
+            ];
+            let center_rgb = pack_rgb(state.current_light_rgb[0], state.current_light_rgb[1], state.current_light_rgb[2]);
+            event.lights.push(NativeColoredLight {
+                at: center_pos,
+                rgb: center_rgb,
+                radius: base_radius,
+                intensity,
+            });
+
+            // Right light
+            let right_pos = [
+                screen_at[0] + right[0] * spread + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] + right[1] * spread + normal[1] * forward_offset,
+            ];
+            let right_rgb = tune_zone(zones[2]);
+            event.lights.push(NativeColoredLight {
+                at: right_pos,
+                rgb: right_rgb,
+                radius: side_radius,
+                intensity: side_intensity,
+            });
         } else {
-            vec![(height as f64 * 0.45, 1.0)]
-        };
-
-        let light_radius = ((width / n_cols as f32) * 2.5)
-            .max(height * 1.3)
-            .max(8.0)
-            .min(48.0);
-
-        let norm_factor = if is_tall { 6.2 } else { 3.8 };
-        let base_light_intensity = (intensity / norm_factor).clamp(0.01, 1.0);
-
-        let alpha = screen_curvature.to_radians() as f64;
-        let radius_arc = if screen_curvature > 0.5 && alpha > 0.001 {
-            (width as f64) / alpha
-        } else {
-            0.0
-        };
-
-        for (y_offset, row_weight) in rows {
-            for col in 0..n_cols {
-                let t = -0.92 + 1.84 * (col as f32 / (n_cols - 1) as f32);
-                let edge_boost = if col == 0 || col == n_cols - 1 { 1.25 } else { 1.0 };
-                let col_intensity = (base_light_intensity * row_weight * edge_boost).clamp(0.0, 1.0);
-
-                // Compute exact 3D position along the flat or curved screen
-                let (pos_x, pos_z, norm_x, norm_z) = if radius_arc > 0.0 {
-                    let phi = (t as f64) * (alpha * 0.5);
-                    let arc_x = right[0] * (radius_arc * phi.sin()) + normal[0] * (radius_arc * (1.0 - phi.cos()));
-                    let arc_z = right[1] * (radius_arc * phi.sin()) + normal[1] * (radius_arc * (1.0 - phi.cos()));
-                    let n_x = normal[0] * phi.cos() - right[0] * phi.sin();
-                    let n_z = normal[1] * phi.cos() - right[1] * phi.sin();
-                    (screen_at[0] + arc_x, screen_at[2] + arc_z, n_x, n_z)
-                } else {
-                    let half_w = (width as f64) * 0.5;
-                    (
-                        screen_at[0] + right[0] * (t as f64 * half_w),
-                        screen_at[2] + right[1] * (t as f64 * half_w),
-                        normal[0],
-                        normal[1],
-                    )
-                };
-
-                let light_pos = [
-                    pos_x + norm_x * forward_offset,
-                    screen_at[1] + y_offset,
-                    pos_z + norm_z * forward_offset,
-                ];
-
-                // Smooth color interpolation across screen zones
-                let light_rgb = if let Some(zones) = zone_colors {
-                    let (c1, c2, factor) = if t <= -0.33 {
-                        let f = ((t + 1.0) / 0.67).clamp(0.0, 1.0);
-                        (zones[0], zones[0], f)
-                    } else if t < 0.0 {
-                        let f = ((t + 0.33) / 0.33).clamp(0.0, 1.0);
-                        (zones[0], zones[1], f)
-                    } else if t <= 0.33 {
-                        let f = (t / 0.33).clamp(0.0, 1.0);
-                        (zones[1], zones[2], f)
-                    } else {
-                        (zones[2], zones[2], 1.0)
-                    };
-                    let r = c1[0] as f32 * (1.0 - factor) + c2[0] as f32 * factor;
-                    let g = c1[1] as f32 * (1.0 - factor) + c2[1] as f32 * factor;
-                    let b = c1[2] as f32 * (1.0 - factor) + c2[2] as f32 * factor;
-                    tune_color(r, g, b)
-                } else {
-                    pack_rgb(
-                        state.current_light_rgb[0],
-                        state.current_light_rgb[1],
-                        state.current_light_rgb[2],
-                    )
-                };
-
-                event.lights.push(NativeColoredLight {
-                    at: light_pos,
-                    rgb: light_rgb,
-                    radius: light_radius,
-                    intensity: col_intensity,
-                });
-            }
+            // Single center light
+            let center_pos = [
+                screen_at[0] + normal[0] * forward_offset,
+                center_y,
+                screen_at[2] + normal[1] * forward_offset,
+            ];
+            let center_rgb = pack_rgb(state.current_light_rgb[0], state.current_light_rgb[1], state.current_light_rgb[2]);
+            event.lights.push(NativeColoredLight {
+                at: center_pos,
+                rgb: center_rgb,
+                radius: base_radius,
+                intensity,
+            });
         }
     }
 

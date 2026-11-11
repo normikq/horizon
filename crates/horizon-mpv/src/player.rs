@@ -100,6 +100,8 @@ struct Shared {
     woken: Condvar,
     /// The newest frame not taken yet.
     frame: Mutex<Option<Vec<u8>>>,
+    /// Recycled frame buffers to avoid reallocating 3.7MB every frame.
+    recycle: Mutex<Vec<Vec<u8>>>,
     frames: AtomicU64,
     render_micros: AtomicU64,
     /// f64 bits, [`NONE`] when mpv has none.
@@ -107,6 +109,8 @@ struct Shared {
     duration: AtomicU64,
     /// `width << 32 | height` of the video as displayed, [`NONE`] before it is known.
     video_size: AtomicU64,
+    /// Currently rendered buffer resolution (`width << 32 | height`).
+    render_size: AtomicU64,
     paused: AtomicBool,
     ended: AtomicBool,
     loaded: AtomicBool,
@@ -218,8 +222,8 @@ impl Player {
                 (c"input-default-bindings", "no".into()),
                 (c"input-vo-keyboard", "no".into()),
                 (c"load-unsafe-playlists", "no".into()),
-                // Decoded on mpv's threads; the software renderer takes system memory.
-                (c"hwdec", "no".into()),
+                // Hardware decode with copy-back to system memory when available (e.g. d3d11va-copy / nvdec-copy).
+                (c"hwdec", "auto-safe".into()),
                 (c"idle", "yes".into()),
                 // The last frame stays up at the end (`ended`).
                 (c"keep-open", "yes".into()),
@@ -247,11 +251,13 @@ impl Player {
                 wake: Mutex::default(),
                 woken: Condvar::new(),
                 frame: Mutex::new(None),
+                recycle: Mutex::new(Vec::new()),
                 frames: AtomicU64::new(0),
                 render_micros: AtomicU64::new(0),
                 position: AtomicU64::new(NONE),
                 duration: AtomicU64::new(NONE),
                 video_size: AtomicU64::new(NONE),
+                render_size: AtomicU64::new(0),
                 paused: AtomicBool::new(false),
                 ended: AtomicBool::new(false),
                 loaded: AtomicBool::new(false),
@@ -320,7 +326,10 @@ impl Player {
 
     /// The size of the frames [`take_frame`](Self::take_frame) gives.
     pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
+        match self.shared.render_size.load(Ordering::Relaxed) {
+            0 => (self.width, self.height),
+            s => ((s >> 32) as u32, s as u32),
+        }
     }
 
     /// Queues an mpv command; mpv runs it on its own thread.
@@ -430,6 +439,17 @@ impl Player {
     /// top row first, opaque. None when mpv showed nothing new.
     pub fn take_frame(&self) -> Option<Vec<u8>> {
         lock(&self.shared.frame).take()
+    }
+
+    /// Recycles a previously taken frame buffer to be reused for future frames.
+    pub fn recycle_frame(&self, mut buf: Vec<u8>) {
+        if buf.capacity() >= (self.width * self.height * 4) as usize {
+            let mut rec = lock(&self.shared.recycle);
+            if rec.len() < 4 {
+                buf.clear();
+                rec.push(buf);
+            }
+        }
     }
 
     /// The average RGB color ([r, g, b] in 0..=255) of the newest frame rendered so far,
@@ -569,18 +589,46 @@ fn run(core: Core, shared: &Shared, width: u32, height: u32) {
         let update = unsafe { (api.mpv_render_context_update)(render) };
         if update & sys::RENDER_UPDATE_FRAME != 0 {
             let started = Instant::now();
-            if let Some(frame) = render_frame(&api, render, width, height) {
+            let (target_w, target_h) = match video {
+                (Some(w), Some(h)) if w > 0 && h > 0 => {
+                    let scale_w = width as f64 / w as f64;
+                    let scale_h = height as f64 / h as f64;
+                    let scale = scale_w.min(scale_h).min(1.0);
+                    let rw = ((w as f64 * scale).round() as u32).clamp(1, width);
+                    let rh = ((h as f64 * scale).round() as u32).clamp(1, height);
+                    (rw, rh)
+                }
+                _ => (width, height),
+            };
+            shared.render_size.store(u64::from(target_w) << 32 | u64::from(target_h), Ordering::Relaxed);
+            let mut buf = lock(&shared.recycle).pop().unwrap_or_default();
+            let needed = (target_w * target_h * 4) as usize;
+            if buf.len() != needed {
+                buf.resize(needed, 0);
+            }
+            if render_frame(&api, render, target_w, target_h, &mut buf) {
                 shared.render_micros.store(
                     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                     Ordering::Relaxed,
                 );
                 shared.frames.fetch_add(1, Ordering::Relaxed);
-                let (avg, left, center, right) = calculate_frame_colors(&frame, width, height);
+                let (avg, left, center, right) = calculate_frame_colors(&buf, target_w, target_h);
                 shared.color.store(avg, Ordering::Relaxed);
                 shared.color_left.store(left, Ordering::Relaxed);
                 shared.color_center.store(center, Ordering::Relaxed);
                 shared.color_right.store(right, Ordering::Relaxed);
-                *lock(&shared.frame) = Some(frame);
+                let mut frame_lock = lock(&shared.frame);
+                if let Some(old) = frame_lock.replace(buf) {
+                    let mut rec = lock(&shared.recycle);
+                    if rec.len() < 4 {
+                        rec.push(old);
+                    }
+                }
+            } else {
+                let mut rec = lock(&shared.recycle);
+                if rec.len() < 4 {
+                    rec.push(buf);
+                }
             }
         }
     }
@@ -601,10 +649,10 @@ fn render_frame(
     render: *mut sys::RenderContext,
     width: u32,
     height: u32,
-) -> Option<Vec<u8>> {
+    pixels: &mut [u8],
+) -> bool {
     let mut size = [width as c_int, height as c_int];
     let mut stride = width as usize * 4;
-    let mut pixels = vec![0u8; stride * height as usize];
     let mut params = [
         sys::RenderParam {
             kind: sys::RENDER_PARAM_SW_SIZE,
@@ -632,13 +680,13 @@ fn render_frame(
     let code = unsafe { (api.mpv_render_context_render)(render, params.as_mut_ptr()) };
     if code < 0 {
         log::warn!("mpv_render_context_render: {}", api.error(code));
-        return None;
+        return false;
     }
     // `rgb0` leaves the fourth byte to the renderer; the atlas wants it opaque.
     for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel[3] = 0xff;
     }
-    Some(pixels)
+    true
 }
 
 /// Analyzes a 16x16 grid of samples across the frame to determine the dominant/average

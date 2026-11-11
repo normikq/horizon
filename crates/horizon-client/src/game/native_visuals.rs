@@ -131,7 +131,7 @@ impl Game<'_> {
     }
 
     fn light_valid(&self, l: &NativeColoredLight, player: [f64; 3]) -> bool {
-        close(l.at, player)
+        close_light(l.at, player, l.radius)
             && l.rgb <= 0xffffff
             && l.radius.is_finite()
             && (0.25..=64.0).contains(&l.radius)
@@ -226,6 +226,15 @@ fn close(at: [f64; 3], player: [f64; 3]) -> bool {
     at.iter().all(|v| v.is_finite())
         && (at[0] - player[0]).powi(2) + (at[1] - player[1]).powi(2) + (at[2] - player[2]).powi(2)
             <= 1024.0
+}
+
+/// Within visual reach of the player, and finite.
+fn close_light(at: [f64; 3], player: [f64; 3], radius: f32) -> bool {
+    at.iter().all(|v| v.is_finite()) && {
+        let max_dist = 128.0_f64 + f64::from(radius);
+        (at[0] - player[0]).powi(2) + (at[1] - player[1]).powi(2) + (at[2] - player[2]).powi(2)
+            <= max_dist * max_dist
+    }
 }
 
 #[cfg(test)]
