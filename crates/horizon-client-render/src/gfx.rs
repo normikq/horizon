@@ -10874,6 +10874,7 @@ impl Renderer {
             // A playing video's quads (`native_draw_video`): entities whose atlas is the
             // video's own texture. A slot with no frame in its texture yet draws nothing.
             let mut first_video = world_quads - all_video_quads;
+            let mut video_drawn = false;
             for (slot, quads) in video_quads.into_iter().enumerate() {
                 let first = (first_video * 4) as i32;
                 first_video += quads;
@@ -10888,6 +10889,9 @@ impl Renderer {
                     pass.set_pipeline(hdr_entity_mark);
                     pass.draw_indexed(0..quads * 6, first, 0..1);
                 }
+                video_drawn = true;
+            }
+            if video_drawn {
                 pass.set_bind_group(0, &self.group, &[]);
             }
             if text_quads > 0 && !oit_on {

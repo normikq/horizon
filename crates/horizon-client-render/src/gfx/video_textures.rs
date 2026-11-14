@@ -466,9 +466,7 @@ impl VideoTextures {
     }
 
     /// The newest copied frame of `slot`, taken for this frame's commands.
-    fn take_ready(&self, slot: usize) -> Option<(wgpu::Buffer, u64, (u32, u32))> {
-        let mut state = self.shared.lock();
-        let staging = &mut state.slots[slot].staging;
+    fn take_ready(staging: &mut [Staging]) -> Option<(wgpu::Buffer, u64, (u32, u32))> {
         let newest = staging
             .iter()
             .filter(|s| s.stage == Stage::Ready)
@@ -494,8 +492,13 @@ impl VideoTextures {
     pub(crate) fn prepare(&mut self, encoder: &mut wgpu::CommandEncoder) {
         let started = Instant::now();
         let mut copied = false;
-        for slot in 0..VIDEO_SLOTS {
-            let Some((buffer, id, (width, height))) = self.take_ready(slot) else {
+        // One lock a frame for every slot, playing or not.
+        let ready: [_; VIDEO_SLOTS] = {
+            let mut state = self.shared.lock();
+            std::array::from_fn(|slot| Self::take_ready(&mut state.slots[slot].staging))
+        };
+        for (slot, ready) in ready.into_iter().enumerate() {
+            let Some((buffer, id, (width, height))) = ready else {
                 continue;
             };
             let size = wgpu::Extent3d {
