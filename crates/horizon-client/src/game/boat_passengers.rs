@@ -221,24 +221,6 @@ impl Game<'_> {
         }
         self.vehicle_mobs.near.set(near);
     }
-    /// The slots, ascending, of the mobs whose box may meet a cart, read from the mobs' grid
-    /// once per cart. None when the mobs are the fewer (asking the carts' grid once per mob
-    /// is then the shorter way) or the grid does not answer.
-    pub(super) fn mobs_near_carts(&self) -> Option<Vec<u32>> {
-        if self.mobs.len() <= self.carts.len() {
-            return None;
-        }
-        let (mut slots, mut near) = (Vec::new(), Vec::new());
-        for c in self.carts.iter() {
-            if !self.vehicle_mobs_near(c.bounds(), &mut near) {
-                return None;
-            }
-            slots.extend_from_slice(&near);
-        }
-        slots.sort_unstable();
-        slots.dedup();
-        Some(slots)
-    }
     /// Whether mob `m`, whose box `reach` bounds, may touch a cart: the carts' grid (`cells`)
     /// names the carts near it, or every cart when the grid cannot (a superset either way).
     pub(super) fn mob_may_meet_cart(
@@ -576,6 +558,10 @@ impl Game<'_> {
             let full = count == b.max_passengers();
             let delta = b.delta_rotation;
             let boat_box = b.bounds();
+            let ridden = horizon_client::motion::RiddenBoat {
+                under_water: b.under_water(),
+                max_y: boat_box.max_position().y,
+            };
             let seats: Vec<_> = mobs
                 .iter()
                 .enumerate()
@@ -608,6 +594,7 @@ impl Game<'_> {
             for (j, offset, at, previous, facing) in seats {
                 let m = &mut self.mobs[j];
                 m.seated(id, offset, boat_box);
+                m.fluids.boat = Some((id, ridden));
                 m.position = at;
                 m.previous = previous;
                 m.velocity = Vec3::ZERO;

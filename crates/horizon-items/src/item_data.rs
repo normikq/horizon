@@ -316,7 +316,7 @@ impl ItemStack {
     /// The stack `ItemStack.CODEC` reads from `tag` (`id`, `count`,
     /// `components`), as `item_nbt::item_from_nbt` does; None for air or an
     /// id that is no valid identifier. The id is not looked up in a registry.
-    /// API @API:item_from_snbt@.
+    /// API 527.
     pub fn from_nbt(tag: &horizon_world::nbt::Compound) -> Option<Self> {
         crate::item_nbt::item_from_nbt(&Tag::Compound(tag.clone()))
     }
@@ -785,10 +785,16 @@ fn template_from(tag: &Tag) -> Option<ItemStack> {
         Tag::String(id) => Some(ItemStack::new(&id.to_string_lossy(), 1)),
         _ => {
             let id = tag.get("id").and_then(string)?;
+            // `ItemStackTemplate.CODEC`: `count` is `ExtraCodecs.intRange(1, 99)`, so a
+            // template outside it does not decode.
+            let count = tag.get("count").and_then(int).unwrap_or(1);
+            if !(1..=99).contains(&count) {
+                return None;
+            }
             let (damage, extra) = decode_components(tag.get("components"));
             Some(ItemStack {
                 item: Arc::from(id.as_str()),
-                count: tag.get("count").and_then(int).unwrap_or(1).max(1) as u32,
+                count: count as u32,
                 damage,
                 extra,
             })
@@ -961,17 +967,27 @@ pub fn encode_components(stack: &ItemStack) -> Option<Tag> {
 /// Context-free callers and the live `components_tag` view stay unchanged.
 pub fn encode_components_with_items(stack: &ItemStack, items: &crate::items::Items) -> Option<Tag> {
     let mut components = encode_components(stack)?;
+    let Some(prototype) = items.get(&stack.item) else {
+        return Some(components);
+    };
     // PatchedDataComponentMap.set removes values equal to the prototype.
-    if let Some(prototype) = items.get(&stack.item)
-        && prototype
-            .components
-            .iter()
-            .any(|id| id == "minecraft:max_stack_size")
+    let same_stack_size = prototype
+        .components
+        .iter()
+        .any(|id| id == "minecraft:max_stack_size")
         && matches!(components.get("minecraft:max_stack_size"), Some(Tag::Int(size))
-            if *size > 0 && *size as u32 == prototype.max_stack)
-        && let Tag::Compound(entries) = &mut components
-    {
-        entries.remove(&JavaString::from("minecraft:max_stack_size"));
+            if *size > 0 && *size as u32 == prototype.max_stack);
+    // A durable prototype carries DAMAGE 0 (`Item.Properties.durability`), so the
+    // explicit zero `components_tag` keeps for a stack-declared MAX_DAMAGE equals it.
+    let same_damage =
+        prototype.max_damage > 0 && matches!(components.get("minecraft:damage"), Some(Tag::Int(0)));
+    if let Tag::Compound(entries) = &mut components {
+        if same_stack_size {
+            entries.remove(&JavaString::from("minecraft:max_stack_size"));
+        }
+        if same_damage {
+            entries.remove(&JavaString::from("minecraft:damage"));
+        }
         if entries.is_empty() {
             return None;
         }
@@ -981,12 +997,15 @@ pub fn encode_components_with_items(stack: &ItemStack, items: &crate::items::Ite
 /// `encode_components` from the damage value and extra components.
 pub fn components_tag(damage: u32, data: Option<&StackData>) -> Option<Tag> {
     let mut entries: Vec<(&str, Tag)> = Vec::new();
-    // A custom max damage can make zero DAMAGE a meaningful saved component.
-    if damage > 0
-        || data.is_some_and(|data| {
-            data.explicit_zero_damage && data.other("minecraft:max_damage").is_some()
-        })
-    {
+    // A patch keeps an explicit DAMAGE that differs from the prototype. A
+    // durable item's prototype already supplies the component, so an explicit
+    // zero equals it and vanilla's `fromPatch` drops it; a normally
+    // non-durable item declares MAX_DAMAGE on the stack and has no prototype
+    // DAMAGE, so its `damage: 0` is part of the patch (`explicit_zero_damage`)
+    // and must survive saving or the stack comes back non-damageable.
+    let own_capacity =
+        data.is_some_and(|d| d.explicit_zero_damage && d.other("minecraft:max_damage").is_some());
+    if damage > 0 || own_capacity {
         entries.push(("minecraft:damage", Tag::Int(damage as i32)));
     }
     if let Some(d) = data {
@@ -2900,5 +2919,24 @@ mod written_book_tests {
             ..book
         };
         assert_eq!(written_book_tag(&unresolved).get("resolved"), None);
+    }
+
+    /// `ItemStackTemplate.CODEC` reads `count` with `intRange(1, 99)`: outside it
+    /// the template is rejected, absent it is 1.
+    #[test]
+    fn a_template_count_outside_one_to_ninety_nine_is_rejected() {
+        let template = |count: Option<i32>| {
+            let mut fields = vec![("id", Tag::String("minecraft:stone".into()))];
+            if let Some(count) = count {
+                fields.push(("count", Tag::Int(count)));
+            }
+            template_from(&Tag::compound(fields)).map(|s| s.count)
+        };
+        assert_eq!(template(None), Some(1));
+        assert_eq!(template(Some(1)), Some(1));
+        assert_eq!(template(Some(99)), Some(99));
+        assert_eq!(template(Some(0)), None);
+        assert_eq!(template(Some(100)), None);
+        assert_eq!(template(Some(-1)), None);
     }
 }

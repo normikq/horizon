@@ -12,7 +12,6 @@ use horizon_client::{
     mobs::{Mob, Species, sulfur_cube},
     particles::{ParticleOptions, ParticleType},
     projectiles::{Projectile, ProjectileKind},
-    random_source,
 };
 // Its old home, for mixin code that names it here.
 pub(super) use horizon_client::mod_api::NativeDispensed;
@@ -439,14 +438,15 @@ impl Game<'_> {
 
     // ---- DefaultDispenseItemBehavior ----
 
-    /// `DispenserBlock.getDispensePosition(source, scale, offset)`.
+    /// `DispenserBlock.getDispensePosition(source, scale, offset)`; vanilla adds
+    /// `scale * step + offset` first, then adds that sum to the block centre.
     fn dispense_position(pos: Pos, facing: Direction, scale: f64, offset: [f64; 3]) -> Vec3 {
         let s = step(facing);
         let c = Self::center(pos);
         Vec3::new(
-            c[0] + scale * f64::from(s[0]) + offset[0],
-            c[1] + scale * f64::from(s[1]) + offset[1],
-            c[2] + scale * f64::from(s[2]) + offset[2],
+            c[0] + (scale * f64::from(s[0]) + offset[0]),
+            c[1] + (scale * f64::from(s[1]) + offset[1]),
+            c[2] + (scale * f64::from(s[2]) + offset[2]),
         )
     }
     /// `DefaultDispenseItemBehavior.spawnItem` at `getDispensePosition`.
@@ -908,7 +908,7 @@ impl Game<'_> {
         };
         let (Some(slot), true) = (
             info.equip_slot.as_deref().and_then(Slot::from_name),
-            info.equip_dispensable,
+            horizon_client::item_sync::dispensable(stack, info.equip_dispensable),
         ) else {
             return false;
         };
@@ -1193,14 +1193,13 @@ impl Game<'_> {
             return;
         }
         // Projectile.shoot spreads the shot with the projectile's own random.
-        let mut own = random_source::entity();
         match item.as_str() {
             "minecraft:experience_bottle"
             | "minecraft:splash_potion"
             | "minecraft:lingering_potion" => {
-                let mut shot = Projectile::new(ProjectileKind::Snowball, at, None);
-                shot.shoot(&mut own, dir, power, uncertainty);
-                self.launch_thrown(one, at, shot.velocity, None);
+                let mut shot = super::potions::thrown_projectile(one, at, false);
+                shot.shoot_own(dir, power, uncertainty);
+                self.add_projectile(shot);
             }
             _ => {
                 let kind = match item.as_str() {
@@ -1240,13 +1239,14 @@ impl Game<'_> {
                     _ => ProjectileKind::Snowball,
                 };
                 let mut shot = Projectile::new(kind, at, None);
+                shot.set_egg_item(&one);
                 // ArrowItem/SpectralArrowItem.asProjectile: dispensed arrows
                 // may be picked up.
                 if let Some(a) = shot.arrow.as_mut() {
                     a.set_item(&one);
                     a.pickup = horizon_client::arrows::Pickup::Allowed;
                 }
-                shot.shoot(&mut own, dir, power, uncertainty);
+                shot.shoot_own(dir, power, uncertainty);
                 self.add_projectile(shot);
             }
         }
@@ -1266,14 +1266,18 @@ impl Game<'_> {
         self.next_entity += 1;
         let (_, uuid) = horizon_client::mobs::living_random();
         self.persist.uuids.insert(self.next_entity, uuid);
-        let mut stand =
+        let stand =
             horizon_client::entities::ArmorStand::new(self.next_entity, foot, y_rot(facing));
-        // Entity.applyImplicitComponents: a name from an anvil names the stand.
-        if let Some(name) = stack.custom_name() {
-            stand.custom_name = Some(horizon_client::text::Text::literal(name));
-        }
         self.world.modified.insert((front.0 >> 4, front.2 >> 4));
         self.armor_stands.push(stand);
+        // EntityType.appendDefaultStackConfig: the dispenser's yaw first, then
+        // the item's createDefaultStackConfig with no user.
+        self.apply_item_stack_config(
+            super::commands::Target::Stand(self.next_entity),
+            "minecraft:armor_stand",
+            &stack,
+            false,
+        );
         (shrink(stack), CLICK)
     }
     /// A tame donkey, mule or llama in front without a chest gets it.
@@ -1342,7 +1346,7 @@ impl Game<'_> {
         self.boats.push(boat);
         // BoatDispenseItemBehavior: createDefaultStackConfig with no user,
         // then setYRot(direction.toYRot()).
-        self.apply_vehicle_stack_config(super::commands::Target::Boat(id), &kind, &stack, false);
+        self.apply_item_stack_config(super::commands::Target::Boat(id), &kind, &stack, false);
         self.set_boat_yaw(id, yaw);
         if self.serving.is_some() || self.options.dedicated.is_some() {
             let boat = self.boats.last().unwrap();
@@ -1392,12 +1396,7 @@ impl Game<'_> {
         self.carts.push(cart);
         // AbstractMinecart.createMinecart: createDefaultStackConfig with no user.
         let id = self.next_entity;
-        self.apply_vehicle_stack_config(
-            super::commands::Target::Cart(id),
-            kind.id(),
-            &stack,
-            false,
-        );
+        self.apply_item_stack_config(super::commands::Target::Cart(id), kind.id(), &stack, false);
         if self.serving.is_some() || self.options.dedicated.is_some() {
             let cart = self.carts.last().unwrap();
             self.native_vehicle_create(

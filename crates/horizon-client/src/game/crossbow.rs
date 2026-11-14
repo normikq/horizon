@@ -367,11 +367,12 @@ impl Game<'_> {
                     a.set_item(ammo);
                     a.set_owner(Some(Who::Player));
                     a.fired_from_weapon = Some(weapon.clone());
+                    a.crossbow_hit_sound = true;
                     a.pierce = pierce;
                 }
                 // Flame: the arrow is spawned burning (EnchantmentHelper.onProjectileSpawned).
                 self.ignite_spawned_arrow(&weapon, &mut arrow);
-                arrow.shoot(&mut self.world.random, dir.to_array(), power, 1.0);
+                arrow.shoot_own(dir.to_array(), power, 1.0);
                 self.add_projectile(arrow);
                 let (player, name, projectile) = (
                     horizon_client::lan::playerdata::ints_uuid(self.acting_player_uuid()),

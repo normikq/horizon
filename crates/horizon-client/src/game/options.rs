@@ -419,6 +419,15 @@ impl Game<'_> {
                     let _ = std::fs::create_dir_all(&dir);
                     super::packs::open_folder(&dir);
                 }
+                Event::ImportPacks(paths) => {
+                    let vanilla = self.vanilla_root();
+                    super::packs::import_resource_packs(
+                        &mut self.ui.options,
+                        &vanilla,
+                        &self.server_packs.active,
+                        &paths,
+                    );
+                }
                 // Horizon's own Add button: the screen picked a hit, the game
                 // owns the folder it lands in.
                 Event::DownloadPack(i) => {
@@ -548,6 +557,7 @@ impl Game<'_> {
     }
     /// Settings that Horizon applies beyond render distance, volume and GUI scale.
     pub(super) fn apply_ui_settings(&mut self) {
+        horizon_client::parallel::set_setting(self.settings.horizon.parallel_tick);
         if horizon_client_render::mipmap::set_dither_cutouts(
             self.settings.horizon.dither_cutout_mips,
         ) {
@@ -575,13 +585,12 @@ impl Game<'_> {
                 s.file.int("textureFiltering"),
                 s.file.int("maxAnisotropyBit"),
             );
-            r.set_world_post(
-                s.horizon.resolution_scale as f32 / 100.0,
-                s.horizon.fxaa,
-                s.horizon.taa,
-                s.horizon.upscaling.ratio(),
-                s.horizon.upscaling_sharpness as f32 / 100.0,
-            );
+            // Dynamic Resolution's scale where it is on; turned off, it starts over at the floor.
+            if !s.horizon.dynamic_resolution {
+                self.dynamic_resolution.reset();
+            }
+            let scale = super::frame_autotune::world_scale(&s.horizon, &self.dynamic_resolution);
+            super::frame_autotune::apply_world_post(r, &s.horizon, scale);
             r.set_frame_generation(
                 s.horizon.frame_generation != horizon_client::graphics::FrameGeneration::Off,
             );

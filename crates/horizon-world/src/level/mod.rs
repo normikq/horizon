@@ -145,7 +145,7 @@ pub use interact::{InteractionResult, PlayerContext, PlayerEffect, UseBranch, hi
 pub use pistons::{BlockEventData, MovingPiston};
 pub use place::{PlaceContext, PlaceOutcome, PlacementContext};
 pub use states::{BlockId, PropKey, StateTable};
-pub use tick::{Precipitation, PrecipitationKind, RandomTickMask};
+pub use tick::{Precipitation, PrecipitationKind, RandomTickMask, RandomTickMaskUpdate};
 pub use ticks::Ticks;
 
 /// `Block.UPDATE_*` flags accepted by [`Behaviours::set_block`].
@@ -203,6 +203,36 @@ pub fn vanilla_sea_level(level: LevelKey) -> i32 {
         LevelKey::END => 0,
         _ => 63,
     }
+}
+
+/// The sea level each level's generator builds with (`ChunkGenerator.getSeaLevel`), by level key.
+/// Filled when a world opens from the noise settings its data packs replace (`set_sea_levels`),
+/// and by each level's generator as it opens (`register_sea_level`).
+static SEA_LEVELS: std::sync::LazyLock<RwLock<HashMap<LevelKey, i32>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Replaces every registered sea level, as a world opens.
+pub fn set_sea_levels(levels: Vec<(LevelKey, i32)>) {
+    *SEA_LEVELS.write().unwrap_or_else(|e| e.into_inner()) = levels.into_iter().collect();
+}
+
+/// Registers one level's sea level: its generator's, or the one a server sent
+/// (`CommonPlayerSpawnInfo.seaLevel`).
+pub fn register_sea_level(level: LevelKey, sea_level: i32) {
+    SEA_LEVELS
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(level, sea_level);
+}
+
+/// A level's sea level (`Level.getSeaLevel`): the registered one, else `vanilla_sea_level`.
+pub fn sea_level_of(level: LevelKey) -> i32 {
+    SEA_LEVELS
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&level)
+        .copied()
+        .unwrap_or_else(|| vanilla_sea_level(level))
 }
 
 /// Game rules consulted by block behaviour (vanilla defaults).
@@ -1457,6 +1487,32 @@ impl Behaviours {
 #[cfg(test)]
 mod dimension_key_tests {
     use super::*;
+
+    /// Tests of the global sea level table take turns, and use their own custom keys.
+    static SEA_TABLE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn an_unregistered_level_has_the_vanilla_sea_level() {
+        let _turn = SEA_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let unknown = LevelKey::parse("test:sea_unregistered").unwrap();
+        assert_eq!(sea_level_of(unknown), 63);
+        assert_eq!(sea_level_of(LevelKey::NETHER), 32);
+        assert_eq!(sea_level_of(LevelKey::END), 0);
+    }
+
+    #[test]
+    fn a_registered_sea_level_wins_until_the_table_is_set_again() {
+        let _turn = SEA_TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        let flat = LevelKey::parse("test:sea_flat").unwrap();
+        let tall = LevelKey::parse("test:sea_tall").unwrap();
+        set_sea_levels(vec![(tall, 120)]);
+        register_sea_level(flat, -63);
+        assert_eq!((sea_level_of(flat), sea_level_of(tall)), (-63, 120));
+        register_sea_level(flat, 5);
+        assert_eq!(sea_level_of(flat), 5);
+        set_sea_levels(Vec::new());
+        assert_eq!((sea_level_of(flat), sea_level_of(tall)), (63, 63));
+    }
 
     #[test]
     fn dimension_and_key_round_trip_and_sea_levels() {

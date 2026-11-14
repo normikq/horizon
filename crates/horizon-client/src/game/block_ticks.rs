@@ -26,21 +26,7 @@ impl Game<'_> {
         self.sync_tick_chunks();
         self.start_ticking_chunks();
         laps.lap("tb_tickets");
-        let levels = self.tickets.levels();
-        let bounds = levels.random_tick_bounds();
-        // Keep the world map's chunk order, including empty chunks
-        // (tick_chunk_random still draws for precipitation in those).
-        scratch.ticking.clear();
-        scratch
-            .ticking
-            .extend(self.world.chunks.keys().copied().filter(|&(x, z)| {
-                if let Some((min_x, min_z, max_x, max_z)) = bounds
-                    && (x < min_x || x > max_x || z < min_z || z > max_z)
-                {
-                    return false;
-                }
-                levels.random_ticking(x, z) && ticking_chunk(&self.world, x, z)
-            }));
+        self.random_tick_chunks(&mut scratch.ticking);
         laps.lap("tb_chunks");
         // Entity.checkInsideBlocks for the plates, tripwires, detector rails and
         // buttons under the players (the host and the LAN guests), the minecarts
@@ -238,40 +224,56 @@ impl Game<'_> {
         if !debug {
             self.tick_scheduled()?;
         }
+        horizon_threads::work::clear_work();
         self.with_level(|b, level, ticks| {
+            // The masks the random ticks will read, built on helper threads first while the
+            // parallel tick is on (`HORIZON_PARALLEL_TICK`): the draws and ticks don't depend on them.
+            if !debug && horizon_client::parallel::lanes() > 1 {
+                horizon_client::spans::time("random_tick_masks", || {
+                    let chunks = &level.world.chunks;
+                    level.random_tick_sections.prepare_masks(
+                        &scratch.ticking,
+                        |key| chunks.get(&key).cloned(),
+                        level.facts,
+                        &|id| b.random_tick_candidate(BlockStateId(id)),
+                    );
+                });
+            }
             horizon_client::spans::time("random_ticks", || {
                 for (x, z) in scratch.ticking.drain(..).filter(|_| !debug) {
                     // The last answer, asked from Y `from` at a world revision:
-                    // the next ticking section and its mask. It stands for a
-                    // later Y up to that section's until a block changes.
-                    let mut last: Option<(u64, i32, Option<(i32, std::rc::Rc<_>)>)> = None;
+                    // the next ticking section. It stands for a later Y up to
+                    // that section's until a block changes; the mask itself is
+                    // retained by tick_chunk_random_masked between callback asks.
+                    let mut last: Option<(u64, i32, Option<i32>)> = None;
                     let pos = horizon_core::position::ChunkPos::new(x, z);
                     b.tick_chunk_random_masked(level, ticks, pos, |level, from| {
                         let revision = level.world.revision;
-                        let stands = last.as_ref().is_some_and(|(r, f, next)| {
-                            *r == revision
-                                && *f <= from
-                                && next.as_ref().is_none_or(|(y, _)| from <= *y)
+                        let stands = last.as_ref().is_some_and(|(r, f, next_y)| {
+                            *r == revision && *f <= from && next_y.is_none_or(|y| from <= y)
                         });
-                        if !stands {
-                            let next = level.world.chunks.get(&(x, z)).and_then(|chunk| {
-                                level.random_tick_sections.next_masked(
-                                    (x, z),
-                                    chunk,
-                                    level.facts,
-                                    |id| b.random_tick_candidate(BlockStateId(id)),
-                                    from,
-                                )
+                        if stands {
+                            return last.as_ref().and_then(|(_, _, next_y)| {
+                                next_y.map(|y| (y, RandomTickMaskUpdate::Keep))
                             });
-                            last = Some((revision, from, next));
                         }
-                        last.as_ref()
-                            .and_then(|(_, _, next)| next.as_ref())
-                            .map(|(y, mask)| (*y, Some(mask.clone())))
+                        let next = level.world.chunks.get(&(x, z)).and_then(|chunk| {
+                            level.random_tick_sections.next_masked(
+                                (x, z),
+                                chunk,
+                                level.facts,
+                                |id| b.random_tick_candidate(BlockStateId(id)),
+                                from,
+                            )
+                        });
+                        let next_y = next.as_ref().map(|(y, _)| *y);
+                        last = Some((revision, from, next_y));
+                        next.map(|(y, mask)| (y, RandomTickMaskUpdate::Replace(Some(mask))))
                     });
                 }
             });
         });
+        horizon_threads::work::clear_work();
         laps = horizon_client::spans::laps();
         let sent = self.lan_broadcast_changes();
         laps.lap("tb_broadcast");
@@ -287,6 +289,30 @@ impl Game<'_> {
         Ok(sent)
     }
 
+    /// `ChunkMap.forEachBlockTickingChunk`: the chunks that random tick this
+    /// tick, empty ones included (`tickChunk` still draws for precipitation in
+    /// those).
+    ///
+    /// Vanilla walks the simulation tracker's own table, whose order doesn't
+    /// follow chunk loading. The world map's order does: it is filled as the
+    /// streaming workers finish, so the level random's draws landed on other
+    /// blocks from one run of a world to the next (#15164). Chunk position
+    /// order is the same every run; vanilla's exact order is its fastutil
+    /// table's slot order, which follows that table's whole history.
+    pub(super) fn random_tick_chunks(&self, out: &mut Vec<(i32, i32)>) {
+        let levels = self.tickets.levels();
+        let bounds = levels.random_tick_bounds();
+        out.clear();
+        out.extend(self.world.chunks.keys().copied().filter(|&(x, z)| {
+            if let Some((min_x, min_z, max_x, max_z)) = bounds
+                && (x < min_x || x > max_x || z < min_z || z > max_z)
+            {
+                return false;
+            }
+            levels.random_ticking(x, z) && ticking_chunk(&self.world, x, z)
+        }));
+        out.sort_unstable();
+    }
     /// Track which chunks are ticking (Ticks needs chunk load/unload).
     pub(super) fn sync_tick_chunks(&mut self) {
         if !self.tick_chunks.synchronize(&self.world.chunks) {
@@ -360,3 +386,6 @@ impl Game<'_> {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod random_order_tests;

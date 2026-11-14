@@ -83,11 +83,15 @@ impl CartIndex {
             .as_ref()
             .is_some_and(|(stamp, ..)| *stamp == mobs.stamp())
         {
-            self.mobs = Some((
-                mobs.stamp(),
-                SeenGrid::new(mobs.iter().map(Mob::bounds)),
-                mobs.iter().filter_map(|m| m.extra.mount).collect(),
-            ));
+            // One walk for both: each mob is a few cache lines away from the next.
+            let mut mounted = FxHashSet::default();
+            let grid = SeenGrid::new(mobs.iter().map(|m| {
+                if let Some(v) = m.extra.mount {
+                    mounted.insert(v);
+                }
+                m.bounds()
+            }));
+            self.mobs = Some((mobs.stamp(), grid, mounted));
         }
         let (_, grid, mounted) = self.mobs.as_ref()?;
         grid.candidates(area, out).then(|| mounted.contains(&cart))
@@ -97,7 +101,7 @@ impl CartIndex {
 /// the usual case while carts tick in order) or found by a scan. A world
 /// with hundreds of mineshaft chest carts asked this of every cart several
 /// times a tick.
-pub(super) fn cart_at(carts: &[Minecart], id: u32, hint: usize) -> Option<usize> {
+pub(in crate::game) fn cart_at(carts: &[Minecart], id: u32, hint: usize) -> Option<usize> {
     if carts.get(hint).is_some_and(|c| c.id == id) {
         return Some(hint);
     }

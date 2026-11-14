@@ -216,19 +216,19 @@ pub fn tick(m: &mut Mob, events: &mut Vec<MobEvent>) {
     let puff = m.extra.size;
     if m.extra.counter > 0 {
         if puff == 0 {
-            m.sound("entity.puffer_fish.blow_up", events);
+            m.voice("entity.puffer_fish.blow_up", events);
             m.extra.size = 1;
         } else if m.extra.counter > 40 && puff == 1 {
-            m.sound("entity.puffer_fish.blow_up", events);
+            m.voice("entity.puffer_fish.blow_up", events);
             m.extra.size = 2;
         }
         m.extra.counter += 1;
     } else if puff != 0 {
         if m.extra.counter2 > 60 && puff == 2 {
-            m.sound("entity.puffer_fish.blow_out", events);
+            m.voice("entity.puffer_fish.blow_out", events);
             m.extra.size = 1;
         } else if m.extra.counter2 > 100 && puff == 1 {
-            m.sound("entity.puffer_fish.blow_out", events);
+            m.voice("entity.puffer_fish.blow_out", events);
             m.extra.size = 0;
         }
         m.extra.counter2 += 1;
@@ -276,8 +276,37 @@ pub(super) fn no_ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) 
     if m.species() == Species::GlowSquid {
         glow_squid_dark_tick(m);
     }
+    if m.species() == Species::Tadpole {
+        // Tadpole.aiStep ages it outside serverAiStep too.
+        grow_up(m, events);
+        super::ai::make_age_locked_particle(m, events);
+    }
 }
-
+/// `Tadpole.aiStep`: growing up into a frog after 24000 ticks.
+fn grow_up(m: &mut Mob, events: &mut Vec<MobEvent>) {
+    if m.extra.age >= 0 && !m.extra.age_locked {
+        m.extra.age += 1;
+        if m.extra.age >= 24_000 && !m.removed {
+            m.removed = true;
+            // Tadpole.ageUp: playSound at its feet, volume 0.15 (not
+            // when silent: Entity.playSound).
+            if !m.silent {
+                let at = [m.position.x, m.position.y, m.position.z];
+                events.push(MobEvent::Sound("entity.tadpole.grow_up", at, 0.15, 1.0));
+            }
+            // `ConversionParams.single(this, false, false)`; the game
+            // finalizes the frog and keeps it persistent.
+            events.push(MobEvent::Convert {
+                from: Box::new(m.clone()),
+                kind: "minecraft:frog",
+                params: super::conversion::Params {
+                    keep_equipment: false,
+                    preserve_can_pick_up_loot: false,
+                },
+            });
+        }
+    }
+}
 /// Species aiStep additions.
 pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
     use Species as S;
@@ -288,29 +317,7 @@ pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
             glow_squid_ai_step(m, events);
         }
         S::Tadpole => {
-            // Tadpole.aiStep: growing up into a frog after 24000 ticks.
-            if m.extra.age >= 0 && !m.extra.age_locked {
-                m.extra.age += 1;
-                if m.extra.age >= 24_000 && !m.removed {
-                    m.removed = true;
-                    // Tadpole.ageUp: playSound at its feet, volume 0.15 (not
-                    // when silent: Entity.playSound).
-                    if !m.silent {
-                        let at = [m.position.x, m.position.y, m.position.z];
-                        events.push(MobEvent::Sound("entity.tadpole.grow_up", at, 0.15, 1.0));
-                    }
-                    // `ConversionParams.single(this, false, false)`; the game
-                    // finalizes the frog and keeps it persistent.
-                    events.push(MobEvent::Convert {
-                        from: Box::new(m.clone()),
-                        kind: "minecraft:frog",
-                        params: super::conversion::Params {
-                            keep_equipment: false,
-                            preserve_can_pick_up_loot: false,
-                        },
-                    });
-                }
-            }
+            grow_up(m, events);
             if !m.fluids.in_water && m.on_ground && m.vertical_collision_below {
                 let (a, b) = (m.random.next_float(), m.random.next_float());
                 m.velocity = Vec3::new(
@@ -319,7 +326,7 @@ pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
                     m.velocity.z + f64::from((b * 2.0 - 1.0) * 0.05),
                 );
                 m.on_ground = false;
-                m.sound("entity.tadpole.flop", events);
+                m.voice("entity.tadpole.flop", events);
             }
             // Tadpole.aiStep: the age lock's particles, after the age.
             super::ai::make_age_locked_particle(m, events);
@@ -340,21 +347,7 @@ pub fn ai_step(m: &mut Mob, w: &MobWorld, events: &mut Vec<MobEvent>) {
                     S::TropicalFish => "entity.tropical_fish.flop",
                     _ => "entity.puffer_fish.flop",
                 };
-                m.sound(flop, events);
-            }
-            if m.species() == S::Pufferfish && m.alive() && m.extra.size > 0 {
-                // Preserve the existing AI-side audio path. Player damage
-                // and poison are dispatched by the player tick, not fish AI.
-                if let Some(p) = &w.player
-                    && p.alive
-                    && !p.creative
-                    && m.bounds()
-                        .inflate(Vec3::new(0.3, 0.3, 0.3))
-                        .intersects(p.bounds)
-                    && m.ai.no_action_time % 10 == 0
-                {
-                    m.sound("entity.puffer_fish.sting", events);
-                }
+                m.voice(flop, events);
             }
             if m.species() == S::Pufferfish {
                 sting_touching_mobs(m, w, events);
@@ -794,18 +787,35 @@ fn can_be_followed(s: Species, followers: i32) -> bool {
 }
 /// `startFollowing` on a recruit, applied after the recruiter's tick. A fish
 /// another leader took this tick (its snapshot was older) stays with it.
-pub fn start_following(mobs: &mut [Mob], fish: u32, leader: u32) {
-    let alive = |mobs: &[Mob], id: u32| mobs.iter().any(|m| m.id == id && m.alive() && !m.removed);
-    let Some(current) = mobs.iter().find(|m| m.id == fish).map(|m| m.extra.leader) else {
+pub fn start_following<M: super::MobSlot>(mobs: &mut [M], fish: u32, leader: u32) {
+    let alive = |mobs: &[M], id: u32| {
+        mobs.iter()
+            .map(super::MobSlot::mob)
+            .any(|m| m.id == id && m.alive() && !m.removed)
+    };
+    let Some(current) = mobs
+        .iter()
+        .map(super::MobSlot::mob)
+        .find(|m| m.id == fish)
+        .map(|m| m.extra.leader)
+    else {
         return;
     };
     if current.is_some_and(|l| alive(mobs, l)) {
         return;
     }
-    if let Some(m) = mobs.iter_mut().find(|m| m.id == fish) {
+    if let Some(m) = mobs
+        .iter_mut()
+        .map(super::MobSlot::mob_mut)
+        .find(|m| m.id == fish)
+    {
         m.extra.leader = Some(leader);
     }
-    if let Some(m) = mobs.iter_mut().find(|m| m.id == leader) {
+    if let Some(m) = mobs
+        .iter_mut()
+        .map(super::MobSlot::mob_mut)
+        .find(|m| m.id == leader)
+    {
         m.extra.followers += 1;
     }
 }
@@ -1730,3 +1740,5 @@ mod squid_tests {
 
 #[cfg(test)]
 mod countdown_tests;
+#[cfg(test)]
+mod pufferfish_sound_tests;

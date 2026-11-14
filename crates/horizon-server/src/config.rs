@@ -48,6 +48,7 @@ path = ""                    # the game program; empty: the one installed beside
 resources = ""               # the prepared game files; empty: resources/ here, else the usual places
 restart_on_crash = true      # start the game again when it crashes
 low_memory = false           # true: no transparent huge pages, ~60 MB less idle for ~1 % more tick time
+parallel_tick = false        # true: the server tick shares its work among helper threads (docs/hosting.md)
 
 [backups]
 every = "6h"                 # automatic backups while the server runs: 30m, 6h, 1d...; "0" turns them off
@@ -107,6 +108,15 @@ enabled = true               # false pauses it and keeps the webhook
 # Fights follow 26.3's rules. For 1.8.9's (no attack cooldown or sweep, 1.8 weapon damage; docs/pvp.md):
 # [combat]
 # legacy = true
+
+# Villagers that cannot move (a trading hall's cells, or riding) skip their brain, which cuts the lag of big halls;
+# they keep trading and restocking (docs/server.md). Not vanilla, so off. Mobs push every mob they overlap, as
+# vanilla does; a crowded pen costs the square of its crowd, and max_collisions caps it (the most other mobs one
+# mob pushes per tick, pushes it receives counted; 0 = no cap, vanilla). To turn them on:
+# [entities]
+# villager_lobotomize = true
+# villager_lobotomize_check_interval = 100   # ticks between rechecks of whether a villager can move
+# max_collisions = 8
 "##;
 
 /// Each typed setting: its section, its name, and the vanilla key it writes.
@@ -175,6 +185,57 @@ pub struct Config {
     /// The game reads this section itself (docs/pvp.md); written only when it isn't the default.
     #[serde(default, skip_serializing_if = "Combat::is_default")]
     pub combat: Combat,
+    /// `[entities]` (docs/server.md): mob settings passed to the game; written only when it isn't the default.
+    #[serde(default, skip_serializing_if = "Entities::is_default")]
+    pub entities: Entities,
+}
+
+/// `[entities]`: `villager_lobotomize = true` skips the brain of villagers that cannot move (stuck in a cell,
+/// riding something), rechecked every `villager_lobotomize_check_interval` ticks. The game reads it from the
+/// same file (game/dedicated.rs, `load_entities`).
+/// `[entities]`: `dab = true` runs a mob's AI less often the farther it is from the nearest player (Pufferfish's
+/// dynamic activation of brain; crates/horizon-client/src/mobs/dab.rs). Off by default: it is not vanilla's
+/// behaviour. A mob farther than `dab_start_distance` blocks runs its AI every
+/// `clamp(distance² >> dab_activation_dist_mod, 1, dab_max_tick_freq)` ticks. `max_collisions = N` limits how many
+/// other mobs one mob pushes in a tick (pushes it receives count too); 0 is vanilla's behaviour, no cap.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Entities {
+    pub villager_lobotomize: bool,
+    pub villager_lobotomize_check_interval: u32,
+    pub dab: bool,
+    pub dab_start_distance: u32,
+    pub dab_max_tick_freq: u32,
+    pub dab_activation_dist_mod: u32,
+    pub max_collisions: u32,
+}
+impl Default for Entities {
+    fn default() -> Self {
+        Self {
+            villager_lobotomize: false,
+            // Must match `mobs::villager::lobotomy::DEFAULT_INTERVAL` in horizon-client (this crate cannot depend on it).
+            villager_lobotomize_check_interval: 100,
+            dab: false,
+            dab_start_distance: 12,
+            dab_max_tick_freq: 20,
+            dab_activation_dist_mod: 8,
+            max_collisions: 0,
+        }
+    }
+}
+impl Entities {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+    fn check(&self) -> Result<(), String> {
+        if self.dab_max_tick_freq == 0 {
+            return Err("entities.dab_max_tick_freq must be at least 1".into());
+        }
+        if self.dab_activation_dist_mod > 30 {
+            return Err("entities.dab_activation_dist_mod must be 30 or less".into());
+        }
+        Ok(())
+    }
 }
 
 /// `[combat]`: `legacy = true` resolves the players' melee hits by 1.8.9's rules (no attack cooldown or sweep,
@@ -241,6 +302,8 @@ pub struct Engine {
     pub restart_on_crash: bool,
     /// The game without transparent huge pages (docs/hosting.md): less memory, slightly slower ticks.
     pub low_memory: bool,
+    /// The game's parallel tick phases (`HORIZON_PARALLEL_TICK=1`), for hosts that cannot set the variable.
+    pub parallel_tick: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -468,6 +531,7 @@ impl Default for Engine {
             resources: String::new(),
             restart_on_crash: true,
             low_memory: false,
+            parallel_tick: false,
         }
     }
 }
@@ -508,7 +572,7 @@ impl Config {
         Self::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
     }
 
-    fn check(&self) -> Result<(), String> {
+    pub(crate) fn check(&self) -> Result<(), String> {
         let w = &self.world;
         if !GAME_MODES.contains(&w.game_mode.as_str()) {
             return Err(format!(
@@ -524,7 +588,14 @@ impl Config {
                 DIFFICULTIES.join(", ")
             ));
         }
-        if w.name.is_empty() || w.name.contains(['/', '\\']) || w.name == ".." {
+        // Not the server folder itself, nor one of the supervisor's own folders in it.
+        if w.name.is_empty()
+            || w.name.contains(['/', '\\'])
+            || matches!(
+                w.name.as_str(),
+                "." | ".." | "backups" | "logs" | ".horizon"
+            )
+        {
             return Err(format!(
                 "world.name \"{}\" must be a folder name, without slashes",
                 w.name
@@ -534,10 +605,14 @@ impl Config {
         self.panel.address()?;
         self.api.check()?;
         self.transfer.check()?;
+        if self.entities.villager_lobotomize_check_interval == 0 {
+            return Err("entities.villager_lobotomize_check_interval must be above zero".into());
+        }
         self.discord.check()?;
         self.anticheat.check()?;
         self.chat_filter.check()?;
         self.prune_chunks.check()?;
+        self.entities.check()?;
         if self.server.port == 0 {
             return Err("server.port must be a port number from 1 to 65535".into());
         }
@@ -582,8 +657,20 @@ impl Config {
             &date_string(now_millis()),
             false,
         );
-        std::fs::write(path, text)?;
+        replace(&path, &text)?;
         Ok(written)
+    }
+
+    /// The level `op` gives a new operator: `op-permission-level` as the game reads it at its next start,
+    /// that is `server.properties` with this configuration's keys written over it (as
+    /// [`Config::write_properties`] does). 4, vanilla's default, when the keys cannot be read.
+    pub fn op_permission_level(&self, dir: &Path) -> i32 {
+        let mut properties = read_properties(&dir.join(PROPERTIES)).unwrap_or_default();
+        for (key, value) in self.vanilla() {
+            properties.put(&key, value);
+        }
+        ServerProperties::new(properties, &mut SystemEntropy::default())
+            .map_or(4, |p| p.op_permission_level)
     }
 
     /// A configuration from a vanilla `server.properties`: typed settings from their keys, and every other
@@ -638,6 +725,7 @@ pub fn render(config: &Config) -> String {
         ("engine", "resources"),
         ("engine", "restart_on_crash"),
         ("engine", "low_memory"),
+        ("engine", "parallel_tick"),
         ("backups", "every"),
         ("backups", "keep"),
         ("updates", "keep"),
@@ -657,7 +745,13 @@ pub fn render(config: &Config) -> String {
         set(&mut doc, section, field, &table[section][field]);
     }
     let mut text = doc.to_string();
-    for section in ["anticheat", "chat_filter", "prune_chunks", "combat"] {
+    for section in [
+        "anticheat",
+        "chat_filter",
+        "prune_chunks",
+        "combat",
+        "entities",
+    ] {
         if let Some(settings) = table.get(section) {
             let mut only = toml::Table::new();
             only.insert(section.into(), settings.clone());
@@ -686,6 +780,7 @@ pub fn sync_back(dir: &Path, written: &[(String, String)]) -> Result<Vec<String>
     if changed.is_empty() {
         return Ok(Vec::new());
     }
+    let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let path = dir.join(FILE);
     let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
@@ -702,8 +797,42 @@ pub fn sync_back(dir: &Path, written: &[(String, String)]) -> Result<Vec<String>
     }
     let updated = doc.to_string();
     Config::parse(&updated)?;
-    std::fs::write(&path, updated).map_err(|e| e.to_string())?;
+    replace(&path, &updated).map_err(|e| e.to_string())?;
     Ok(changed.iter().map(|(k, _)| (*k).to_owned()).collect())
+}
+
+/// Held while `server.toml` is read, changed and written back, so two of this process's writers
+/// (management clients, the API, the supervisor's [`sync_back`]) don't drop each other's change.
+static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Writes `text` to `path` through a new file renamed over it: a reader (or a crash) sees the old
+/// file or the new one, never an empty or half-written one. An empty `server.toml` reads as every
+/// default, and the next start would write those into `server.properties`. Another process (the
+/// CLI's `config set`) has its own temporary file.
+pub(crate) fn replace(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .map_or_else(Default::default, |n| n.to_string_lossy());
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = (|| {
+        let mut file = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut file, text.as_bytes())?;
+        file.sync_all()?;
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
 }
 
 /// Sets one typed setting in `server.toml` (`whitelist on`), keeping the owner's comments.
@@ -714,6 +843,7 @@ pub fn update(dir: &Path, section: &str, field: &str, value: toml::Value) -> Res
 /// Sets settings in `server.toml`, keeping the owner's comments; nothing is written unless the result is
 /// a valid configuration.
 pub fn update_all(dir: &Path, changes: &[(String, String, toml::Value)]) -> Result<(), String> {
+    let _one = WRITING.lock().unwrap_or_else(|e| e.into_inner());
     let path = dir.join(FILE);
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{e}"))?;
@@ -722,7 +852,7 @@ pub fn update_all(dir: &Path, changes: &[(String, String, toml::Value)]) -> Resu
     }
     let updated = doc.to_string();
     Config::parse(&updated)?;
-    std::fs::write(&path, updated).map_err(|e| e.to_string())
+    replace(&path, &updated).map_err(|e| e.to_string())
 }
 
 pub fn read_properties(path: &Path) -> Result<Properties, String> {
@@ -874,6 +1004,35 @@ mod tests {
     }
 
     #[test]
+    fn the_collision_cap_is_off_unless_its_section_sets_it() {
+        assert_eq!(Config::default().entities.max_collisions, 0);
+        assert!(!TEMPLATE.lines().any(|l| l.trim() == "[entities]"));
+        let on = Config::parse(&format!("{TEMPLATE}\n[entities]\nmax_collisions = 8\n")).unwrap();
+        assert_eq!(on.entities.max_collisions, 8);
+        assert_eq!(Config::parse(&render(&on)).unwrap(), on);
+        let off = render(&Config::default());
+        assert!(!off.lines().any(|l| l.trim() == "[entities]"), "{off}");
+        assert!(Config::parse("[entities]\nmax_collisions = -1\n").is_err());
+        assert!(Config::parse("[entities]\nmax_collision = 8\n").is_err());
+    }
+
+    #[test]
+    fn dab_is_off_unless_its_section_turns_it_on() {
+        assert!(!Config::default().entities.dab);
+        let off = render(&Config::default());
+        assert!(!off.lines().any(|l| l.trim() == "[entities]"), "{off}");
+        let on = Config::parse("[entities]\ndab = true\ndab_max_tick_freq = 10\n").unwrap();
+        assert!(on.entities.dab);
+        assert_eq!(on.entities.dab_start_distance, 12);
+        assert_eq!(on.entities.dab_activation_dist_mod, 8);
+        // Kept when the file is written again.
+        assert_eq!(Config::parse(&render(&on)).unwrap(), on);
+        assert!(Config::parse("[entities]\ndab_max_tick_freq = 0\n").is_err());
+        assert!(Config::parse("[entities]\ndab_activation_dist_mod = 99\n").is_err());
+        assert!(Config::parse("[entities]\ndap = true\n").is_err());
+    }
+
+    #[test]
     fn legacy_combat_is_off_unless_its_section_turns_it_on() {
         assert!(!Config::default().combat.legacy);
         assert!(!TEMPLATE.lines().any(|l| l.trim() == "[combat]"));
@@ -885,6 +1044,27 @@ mod tests {
         assert!(!off.lines().any(|l| l.trim() == "[combat]"), "{off}");
         assert!(Config::parse("[combat]\nlegacy = 1\n").is_err());
         assert!(Config::parse("[combat]\nlegcy = true\n").is_err());
+    }
+
+    #[test]
+    fn villager_lobotomize_is_off_unless_its_section_turns_it_on() {
+        let off = Config::default().entities;
+        assert!(!off.villager_lobotomize);
+        assert_eq!(off.villager_lobotomize_check_interval, 100);
+        assert!(!TEMPLATE.lines().any(|l| l.trim() == "[entities]"));
+        let on = Config::parse(&format!(
+            "{TEMPLATE}\n[entities]\nvillager_lobotomize = true\nvillager_lobotomize_check_interval = 40\n"
+        ))
+        .unwrap();
+        assert!(on.entities.villager_lobotomize);
+        assert_eq!(on.entities.villager_lobotomize_check_interval, 40);
+        // Kept when the file is written again, and left out while off.
+        assert_eq!(Config::parse(&render(&on)).unwrap(), on);
+        let text = render(&Config::default());
+        assert!(!text.lines().any(|l| l.trim() == "[entities]"), "{text}");
+        assert!(Config::parse("[entities]\nvillager_lobotomize = 1\n").is_err());
+        assert!(Config::parse("[entities]\nvillager_lobotomise = true\n").is_err());
+        assert!(Config::parse("[entities]\nvillager_lobotomize_check_interval = 0\n").is_err());
     }
 
     #[test]
@@ -980,6 +1160,49 @@ mod tests {
         assert!(Config::parse("[server]\nprot = 1\n").is_err());
         assert!(Config::parse("[properties]\nmotd = \"x\"\n").is_err());
         assert!(Config::parse("[world]\nname = \"../x\"\n").is_err());
+        for folder in [".", "..", "backups", "logs", ".horizon"] {
+            let text = format!("[world]\nname = \"{folder}\"\n");
+            assert!(Config::parse(&text).is_err(), "{folder}");
+        }
+    }
+
+    #[test]
+    fn settings_changed_at_once_are_all_kept() {
+        let dir =
+            std::env::temp_dir().join(format!("horizon-server-at-once-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(FILE), TEMPLATE).unwrap();
+        // Eight writers at once, as eight management clients each setting another key.
+        std::thread::scope(|scope| {
+            for n in 0..8i64 {
+                let dir = &dir;
+                scope.spawn(move || {
+                    update(
+                        dir,
+                        "properties",
+                        &format!("horizon-test-{n}"),
+                        toml::Value::Integer(n),
+                    )
+                    .unwrap()
+                });
+            }
+        });
+        let c = Config::load(&dir).unwrap();
+        for n in 0..8i64 {
+            assert_eq!(
+                c.properties.get(&format!("horizon-test-{n}")),
+                Some(&toml::Value::Integer(n)),
+                "horizon-test-{n} kept"
+            );
+        }
+        // No temporary file is left beside it.
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [std::ffi::OsString::from(FILE)]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -284,6 +284,7 @@ impl<L: LevelAccess + ?Sized> Sim<'_, L> {
     /// `BlockState.randomTick` followed by the fluid's random tick.
     pub fn random_tick_at(&mut self, pos: BlockPos) {
         let state = self.state(pos);
+        horizon_threads::work::set_block(self.b.block(state).0);
         if self.b.is_randomly_ticking(state) {
             let (mut current, mut handled) = (state, false);
             self.level
@@ -1776,6 +1777,8 @@ impl Behaviours {
         while let Ok(Some(tick)) = ticks.blocks.next_tick() {
             let mut sim = self.sim(level, ticks);
             let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
             if u32::from(self.block(state).0) == tick.kind.0 {
                 sim.tick_due_block(state, tick.pos);
             }
@@ -1796,7 +1799,10 @@ impl Behaviours {
         }
         while let Ok(Some(tick)) = ticks.fluids.next_tick() {
             let mut sim = self.sim(level, ticks);
-            let fluid = self.fluid(sim.state(tick.pos)).kind();
+            let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
+            let fluid = self.fluid(state).kind();
             if TickTypeId(fluid.index() as u32) == tick.kind {
                 sim.fluid_tick(tick.pos);
             }
@@ -1845,7 +1851,10 @@ impl Behaviours {
                 return false;
             };
             let mut sim = self.sim(level, ticks);
-            let fluid = self.fluid(sim.state(tick.pos)).kind();
+            let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
+            let fluid = self.fluid(state).kind();
             if TickTypeId(fluid.index() as u32) == tick.kind {
                 sim.fluid_tick(tick.pos);
             }
@@ -1855,6 +1864,8 @@ impl Behaviours {
             };
             let mut sim = self.sim(level, ticks);
             let state = sim.state(tick.pos);
+            horizon_threads::work::set_chunk(tick.pos.x >> 4, tick.pos.z >> 4);
+            horizon_threads::work::set_block(self.block(state).0);
             if u32::from(self.block(state).0) == tick.kind.0 {
                 sim.tick_due_block(state, tick.pos);
             }
@@ -1885,7 +1896,7 @@ impl Behaviours {
         mut next_ticking: impl FnMut(&mut L, i32) -> Option<i32>,
     ) {
         self.tick_chunk_random_masked(level, ticks, chunk, |level, from| {
-            next_ticking(level, from).map(|min_y| (min_y, None))
+            next_ticking(level, from).map(|min_y| (min_y, RandomTickMaskUpdate::Replace(None)))
         });
     }
     /// [`Self::tick_chunk_random`], where `next_ticking` may also give the
@@ -1898,13 +1909,14 @@ impl Behaviours {
         level: &mut L,
         ticks: &mut Ticks,
         chunk: ChunkPos,
-        mut next_ticking: impl FnMut(&mut L, i32) -> Option<(i32, Option<Rc<RandomTickMask>>)>,
+        mut next_ticking: impl FnMut(&mut L, i32) -> Option<(i32, RandomTickMaskUpdate)>,
     ) {
         let speed = level.game_rules().random_tick_speed;
         if speed <= 0 {
             return;
         }
         let (min_x, min_z) = (chunk.x * 16, chunk.z * 16);
+        horizon_threads::work::set_chunk(chunk.x, chunk.z);
         for _ in 0..speed {
             if level.random().next_int_bound(48).unwrap_or(1) == 0 {
                 let pos = ticks.block_random_pos(min_x, 0, min_z, 15);
@@ -1914,18 +1926,31 @@ impl Behaviours {
             }
         }
         let mut from = level.min_y();
-        while let Some((min_y, mut mask)) =
-            next_ticking(level, from).filter(|&(y, _)| y < level.max_y())
-        {
+        let mut mask = None;
+        while let Some((min_y, update)) = next_ticking(level, from) {
+            if min_y >= level.max_y() {
+                break;
+            }
+            if let RandomTickMaskUpdate::Replace(next) = update {
+                mask = next;
+            }
             for _ in 0..speed {
                 let pos = ticks.block_random_pos(min_x, min_y, min_z, 15);
                 if mask.as_ref().is_none_or(|m| m.may_tick(pos)) {
                     self.sim(level, ticks).random_tick_at(pos);
                     // The same section as it is now; one that stopped
                     // ticking still gets the rest of its draws, unfiltered.
-                    mask = next_ticking(level, min_y)
-                        .filter(|&(y, _)| y == min_y)
-                        .and_then(|(_, m)| m);
+                    if let Some((y, update)) = next_ticking(level, min_y) {
+                        if y == min_y {
+                            if let RandomTickMaskUpdate::Replace(next) = update {
+                                mask = next;
+                            }
+                        } else {
+                            mask = None;
+                        }
+                    } else {
+                        mask = None;
+                    }
                 }
             }
             from = min_y + 16;
@@ -1979,6 +2004,15 @@ impl Behaviours {
     ) {
         self.sim(level, ticks).fluid_tick(pos);
     }
+}
+
+/// How [`Behaviours::tick_chunk_random_masked`] should update the current
+/// section mask. `Keep` reuses the mask already held by the tick loop, so a
+/// callback can answer repeated asks without cloning its `Rc`.
+#[derive(Debug)]
+pub enum RandomTickMaskUpdate {
+    Keep,
+    Replace(Option<Rc<RandomTickMask>>),
 }
 
 /// Which of a section's 4,096 blocks a random tick can do anything for

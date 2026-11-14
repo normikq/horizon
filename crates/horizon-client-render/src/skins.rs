@@ -93,6 +93,8 @@ pub fn unpack(value: &str, signature: Signature, valid_uris: &[impl AsRef<str>])
         signed: signature == Signature::Signed,
         ..empty.clone()
     };
+    // Authlib's MinecraftServicesSessionService validates every URL in
+    // unpackTextures before returning any textures. A bad cape rejects the skin too.
     for (kind, texture) in textures {
         let Some(url) = texture.get("url").and_then(|u| u.as_str()) else {
             return empty;
@@ -1385,6 +1387,8 @@ mod tests {
                     &super::TEXTURE_URIS,
                 );
                 assert_eq!(textures.slim, slim && !url.contains("evil"));
+                // Authlib rejects the whole payload if any URL is invalid,
+                // including the allowed cape when the skin is disallowed.
                 assert_eq!(textures.cape.is_some(), !url.contains("evil"));
                 assert_eq!(parsed.skin.is_some(), !url.contains("evil"));
                 assert!(std::sync::Arc::ptr_eq(&parsed, &cache.get(&profile)));
@@ -1537,6 +1541,15 @@ mod tests {
         );
         assert!(t.slim);
         assert!(!unpack(wide, Signature::Signed, &TEXTURE_URIS).slim);
+    }
+    /// Authlib's `MinecraftServicesSessionService` rejects the whole profile in
+    /// `unpackTextures` when any texture URL is outside the allowed origins.
+    #[test]
+    fn unpack_rejects_the_skin_when_another_texture_is_rejected() {
+        use super::{Signature, TEXTURE_URIS, unpack};
+        let mixed = "eyJ0ZXh0dXJlcyI6IHsiU0tJTiI6IHsidXJsIjogImh0dHBzOi8vdGV4dHVyZXMubWluZWNyYWZ0Lm5ldC90ZXh0dXJlL3NraW4xIn0sICJDQVBFIjogeyJ1cmwiOiAiaHR0cHM6Ly9ldmlsLmV4YW1wbGUvdGV4dHVyZS9jYXBlMSJ9fX0=";
+        let t = unpack(mixed, Signature::Unsigned, &TEXTURE_URIS);
+        assert_eq!(t, super::Textures::default());
     }
     #[test]
     fn profiles_parse_like_resolvable_profiles() {

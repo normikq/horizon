@@ -1,0 +1,15 @@
+{
+  "hooks": [],
+  "helpers": [
+    {
+      "name": "has_right_down",
+      "target": "horizon_client::game::native_client_services::Game<'_>::native_has_right_down"
+    },
+    {
+      "name": "has_left_down",
+      "target": "horizon_client::game::native_client_services::Game<'_>::native_has_left_down"
+    }
+  ],
+  "rust_summary": "live mouse button state checks (`native_has_right_down`, `native_has_left_down`).",
+  "doc_summary": "`Host` gains `has_right_down()` and `has_left_down()` to check live mouse button state. Bundles need \"hooks\": @API:mouse_buttons@."
+}

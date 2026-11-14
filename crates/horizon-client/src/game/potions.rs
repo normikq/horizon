@@ -385,31 +385,21 @@ impl Game<'_> {
                 .play("minecraft:entity.silverfish.hurt", Some(at), 1.0, 1.0);
         }
     }
-    /// A splash potion, lingering potion or experience bottle in flight (the
-    /// player's throws and dispensers both end up here).
-    pub(super) fn launch_thrown(
-        &mut self,
-        stack: ItemStack,
-        position: Vec3,
-        velocity: Vec3,
-        owner: Option<Text>,
-    ) {
-        let id = self.take_entity_id();
-        self.potions.thrown.push(ThrownPotion {
-            id,
-            stack,
-            previous: position,
-            position,
-            velocity,
-            age: 0,
-            thrower: owner.is_some().then_some(Who::Player),
-            guest: self.lan_acting.filter(|_| owner.is_some()),
-            owner,
-            left_owner: false,
-            last_deflected_by: None,
-            random: LegacyRandom::new(i64::from(id)),
-        });
-    }
+}
+/// A splash potion, lingering potion or experience bottle about to fly (the
+/// player's throws and dispensers both make one): `ThrownSplashPotion`,
+/// `ThrownLingeringPotion` or `ThrownExperienceBottle`, which
+/// `level.addFreshEntity` makes a level entity like a summoned one, so
+/// selectors and `/data` find it (#13201).
+pub(super) fn thrown_projectile(stack: ItemStack, position: Vec3, by_player: bool) -> Projectile {
+    let kind = match &*stack.item {
+        "minecraft:experience_bottle" => ProjectileKind::ExperienceBottle,
+        item => {
+            let lingering = item == "minecraft:lingering_potion";
+            ProjectileKind::Potion(Box::new(stack), lingering)
+        }
+    };
+    Projectile::new(kind, position, by_player.then_some(Who::Player))
 }
 /// What a player's body was last given for its effects and enchantments:
 /// a guest keeps their own while the host's are in `PotionState`.
@@ -586,43 +576,21 @@ impl Game<'_> {
                     _ => ("minecraft:entity.lingering_potion.throw", 0.5),
                 };
                 self.audio.play(sound, Some(eye), 0.5, pitch);
-                // Projectile.shootFromRotation(xRot, yRot, -20, 0.5, 1.0).
-                let (yaw, pitch) = (self.yaw.to_radians(), self.pitch.to_radians());
-                let dir = [
-                    -yaw.sin() * pitch.cos(),
-                    -(self.pitch - 20.0).to_radians().sin(),
-                    yaw.cos() * pitch.cos(),
-                ];
-                let l = dir
-                    .iter()
-                    .map(|c| f64::from(*c).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-                    .max(1e-9);
-                // getMovementToShoot: normalize, add triangle(0, 0.0172275 * uncertainty), scale.
-                let r = &mut self.world.random;
-                let mut jitter = || r.triangle(0.0, 0.0172275);
-                let v = Vec3::new(
-                    (f64::from(dir[0]) / l + jitter()) * power,
-                    (f64::from(dir[1]) / l + jitter()) * power,
-                    (f64::from(dir[2]) / l + jitter()) * power,
-                );
-                let pv = self.known_player_movement();
+                // Projectile.shootFromRotation(xRot, yRot, -20, power, 1.0), with
+                // what the thrower last moved (getKnownMovement).
+                let velocity = self.known_player_movement();
                 let on_ground = self.player.as_ref().is_some_and(|p| p.ground.on_ground);
-                let v = Vec3::new(
-                    v.x + pv.x,
-                    v.y + if on_ground { 0.0 } else { pv.y },
-                    v.z + pv.z,
+                let one = ItemStack {
+                    count: 1,
+                    ..stack.clone()
+                };
+                let mut shot =
+                    thrown_projectile(one, Vec3::new(eye[0], eye[1] - 0.1, eye[2]), true);
+                shot.shoot_from_rotation(
+                    self.pitch, self.yaw, -20.0, power, 1.0, velocity, on_ground,
                 );
-                self.launch_thrown(
-                    ItemStack {
-                        count: 1,
-                        ..stack.clone()
-                    },
-                    Vec3::new(eye[0], eye[1] - 0.1, eye[2]),
-                    v,
-                    Some(self.player_display_text()),
-                );
+                shot.guest = self.lan_acting;
+                self.add_projectile(shot);
                 // ThrowablePotionItem.use / ExperienceBottleItem.use: awardStat(ITEM_USED).
                 self.award_stat("used", &stack.item, 1);
                 self.swing_arm();
@@ -1410,7 +1378,7 @@ impl Game<'_> {
                 return false;
             }
             if deflect_stop {
-                return t.age < 1200 && t.position.y > -128.0;
+                return t.age < 1200 && t.position.y >= self.world.below_world_y();
             }
             t.position = next;
             let bounds = Aabb::new(
@@ -1418,7 +1386,7 @@ impl Game<'_> {
                 next.add_vector(Vec3::new(0.125, 0.25, 0.125)),
             );
             self.entity_powder_snow_particles(t.previous, next, bounds, t.velocity, false);
-            t.age < 1200 && t.position.y > -128.0
+            t.age < 1200 && t.position.y >= self.world.below_world_y()
         });
         self.potions.thrown = thrown;
         for id in deflected {
@@ -1608,6 +1576,7 @@ impl Game<'_> {
         self.breath_clouds.push(Breath {
             id,
             at,
+            motion: [0.0; 3],
             radius: 2.5,
             age: 0,
             duration: 300,
@@ -1949,7 +1918,14 @@ impl Game<'_> {
         // Projectile.onHit calls onHitBlock first, then the potion's
         // affectEntitiesAround; both read the stack's `potion_contents`.
         if let Some((cell, face)) = hit {
-            self.potion_hit_block(stack, cell, face);
+            // `AbstractThrownPotion.douseFire` passes `getOwner()` to the
+            // campfire's `douse`, which is where the game event's source is.
+            let who = if owner.player {
+                Some(Who::Player)
+            } else {
+                owner.attacker.map(Who::Mob)
+            };
+            self.potion_hit_block(stack, cell, face, who);
         }
         self.affect_entities_around(stack, at, owner.player);
         let lingering = &*stack.item == "minecraft:lingering_potion";
@@ -2006,6 +1982,7 @@ impl Game<'_> {
                 self.breath_clouds.push(Breath {
                     id,
                     at: [at.x, at.y, at.z],
+                    motion: [0.0; 3],
                     radius: 3.0,
                     age: 0,
                     duration: 600,
@@ -2189,6 +2166,7 @@ mod tests {
         let cloud = Breath {
             id: 7,
             at: [1.5, 64.0, -2.5],
+            motion: [0.6, 0.0, 0.0],
             radius: 3.5,
             age: 12,
             duration: 400,
@@ -2217,6 +2195,7 @@ mod tests {
         let tag = potion_cloud_to_nbt(&cloud, [1, 2, 3, 4], None);
         let (at, back) = potion_cloud_from_nbt(&tag).expect("the cloud reads back");
         assert_eq!(at, Vec3::new(1.5, 64.0, -2.5), "the position");
+        assert_eq!(back.motion, [0.6, 0.0, 0.0], "the motion");
         assert_eq!((back.age, back.duration), (12, 400));
         assert!((back.radius - 3.5).abs() < 1.0e-6, "{}", back.radius);
         let potion = back.potion.expect("a potion cloud");
@@ -2388,6 +2367,7 @@ mod tests {
         let mut clouds = vec![super::super::dragon::Breath {
             id: 1,
             at: [1.0, 64.0, 0.0],
+            motion: [0.0; 3],
             radius: 5.0,
             age: 0,
             duration: 200,
@@ -2410,6 +2390,7 @@ mod tests {
         let mut non_dragon = vec![super::super::dragon::Breath {
             id: 1,
             at: [0.0, 64.0, 0.0],
+            motion: [0.0; 3],
             radius: 3.0,
             age: 0,
             duration: 600,
@@ -2424,6 +2405,7 @@ mod tests {
         let mut lingering = vec![super::super::dragon::Breath {
             id: 2,
             at: [0.0, 64.0, 0.0],
+            motion: [0.0; 3],
             radius: 3.0,
             age: 0,
             duration: 600,
@@ -2451,6 +2433,7 @@ mod tests {
         let mut last = vec![super::super::dragon::Breath {
             id: 3,
             at: [0.0, 64.0, 0.0],
+            motion: [0.0; 3],
             radius: 5.0,
             age: 219,
             duration: 200,
@@ -2465,6 +2448,7 @@ mod tests {
         let mut expired = vec![super::super::dragon::Breath {
             id: 3,
             at: [0.0, 64.0, 0.0],
+            motion: [0.0; 3],
             radius: 5.0,
             age: 220,
             duration: 200,
@@ -2480,6 +2464,7 @@ mod tests {
         let mut far = vec![super::super::dragon::Breath {
             id: 4,
             at: [10.0, 64.0, 0.0],
+            motion: [0.0; 3],
             radius: 1.0,
             age: 0,
             duration: 200,
@@ -2496,6 +2481,7 @@ mod tests {
         let mut ground_cloud = vec![super::super::dragon::Breath {
             id: 5,
             at: [0.0, 64.0, 0.0],
+            motion: [0.0; 3],
             radius: 1.0,
             age: 0,
             duration: 200,
@@ -2649,6 +2635,7 @@ mod mob_absorption_max_tests {
         game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
         game.creative = true;
         assert!(game.run_command("scoreboard objectives add h203 dummy"));
+        game.load_ticking_neighbourhood(0, 0);
         test(&mut game);
     }
     fn pig(game: &Game<'_>, n: i32) -> usize {
@@ -2818,6 +2805,7 @@ mod mob_health_boost_tests {
         assert!(game.run_command("forceload add 0 0"));
         game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
         game.creative = true;
+        game.load_ticking_neighbourhood(0, 0);
         test(&mut game);
     }
     fn pig(game: &Game<'_>, n: i32) -> usize {
@@ -3063,6 +3051,7 @@ mod depleted_absorption_tests {
         assert!(game.run_command("forceload add 0 0"));
         game.player = Some(PlayerMotion::new(game.motion, Vec3::new(2.5, 200.0, 2.5)).unwrap());
         game.creative = true;
+        game.load_ticking_neighbourhood(0, 0);
         test(&mut game);
     }
     /// The mob in the level with UUID word `n`.

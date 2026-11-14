@@ -21,6 +21,31 @@ use horizon_world::{
     registry::BlockStateId,
 };
 
+/// `DeathProtection.TOTEM_EFFECTS`: clear, then regeneration II, absorption II
+/// and fire resistance.
+pub(super) fn totem_death_effects() -> Vec<crate::items::ConsumeEffect> {
+    use crate::items::{ConsumeEffect, ConsumeEffectSpec};
+    let spec = |id: &str, duration, amplifier| ConsumeEffectSpec {
+        id: id.to_owned(),
+        duration,
+        amplifier,
+        ambient: false,
+        show_particles: true,
+        show_icon: true,
+    };
+    vec![
+        ConsumeEffect::ClearAllEffects,
+        ConsumeEffect::ApplyEffects {
+            effects: vec![
+                spec("minecraft:regeneration", 900, 1),
+                spec("minecraft:absorption", 100, 1),
+                spec("minecraft:fire_resistance", 800, 0),
+            ],
+            probability: 1.0,
+        },
+    ]
+}
+
 /// How many block particles a landing throws up
 /// (`(int)(min(0.2F + power / 15, 2.5) * 150)`), none when the fall is within
 /// `safe_fall_distance` (`power = max(floor(fall + 1.0E-6 - safe), 0)`).
@@ -75,6 +100,10 @@ pub struct Fluids {
     /// The mod fluid the mob is deepest in (`isInFluidType`): not water to the
     /// game, but the mob moves in it as in water, with its numbers.
     pub modded: Option<ModFluidImmersion>,
+    /// The boat `positionRider` last seated the mob in, by id, and what
+    /// `AbstractBoat.modifyPassengerFluidInteractionBox` reads of it. Kept
+    /// across `update_fluids`; good while the mob still rides that boat.
+    pub boat: Option<(u32, crate::motion::RiddenBoat)>,
 }
 /// `FluidFlowWorld` over the mob's scene: the neighbours a flow vector reads.
 struct FlowScene<'a, 'w>(&'a MobWorld<'w>);
@@ -358,6 +387,22 @@ impl MobWorld<'_> {
     /// `BlockState.getCollisionShape(level, pos)` (the empty collision
     /// context) as boxes in the world.
     pub fn block_collision_boxes(&self, x: i32, y: i32, z: i32) -> Vec<Aabb> {
+        let offset = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
+        self.block_shape(x, y, z)
+            .map(|shape| shape.boxes().iter().map(|b| b.move_by(offset)).collect())
+            .unwrap_or_default()
+    }
+    /// Whether the block's collision shape (empty context) has a box meeting `area`.
+    fn block_collides_with(&self, x: i32, y: i32, z: i32, area: Aabb) -> bool {
+        let offset = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
+        self.block_shape(x, y, z).is_some_and(|shape| {
+            shape
+                .boxes()
+                .iter()
+                .any(|b| b.move_by(offset).intersects(area))
+        })
+    }
+    fn block_shape(&self, x: i32, y: i32, z: i32) -> Option<horizon_core::geometry::VoxelShape> {
         let mut scene = SceneCollisions {
             world: self.world,
             binding: self.collision,
@@ -366,11 +411,9 @@ impl MobWorld<'_> {
         let state = self.world.block(x, y, z);
         let at = horizon_core::position::BlockPos::new(x, y, z);
         let context = horizon_world::collision_context::CollisionContext::empty(false);
-        let offset = Vec3::new(f64::from(x), f64::from(y), f64::from(z));
         self.collision
             .collision_shape_with_context(&mut scene, state, at, &context)
-            .map(|shape| shape.boxes().iter().map(|b| b.move_by(offset)).collect())
-            .unwrap_or_default()
+            .ok()
     }
     /// `Level.findSupportingBlock`: of the blocks whose collision shape
     /// meets `area`, the one whose centre is nearest `from` (ties: the
@@ -423,11 +466,7 @@ impl MobWorld<'_> {
                     {
                         continue;
                     }
-                    if !self
-                        .block_collision_boxes(x, y, z)
-                        .iter()
-                        .any(|b| b.intersects(area))
-                    {
+                    if !self.block_collides_with(x, y, z, area) {
                         continue;
                     }
                     let d = (f64::from(x) + 0.5 - from.x).powi(2)
@@ -734,6 +773,12 @@ impl Mob {
     /// nautiluses keep their own course.
     fn pushed_by_fluid(&self) -> bool {
         use super::Species as S;
+        // Drowned.isPushedByFluid: a drowned swimming after its target is not
+        // pushed by the current, one walking the bottom is (`extra.flag` holds
+        // the `isSwimming` that `Drowned.updateSwimming` sets).
+        if self.species() == S::Drowned && self.extra.flag {
+            return false;
+        }
         !matches!(
             self.species(),
             S::Tadpole
@@ -839,9 +884,16 @@ impl Mob {
         let scene = SceneCollisions {
             world: w.world,
             binding: w.collision,
-            subject: self.kind.flags.lava_walker.then(|| PowderSnowSubject {
+            // PowderSnowBlock.getCollisionShape asks every entity for its fall
+            // distance, the walkable-mob tag and leather boots on its feet.
+            subject: Some(PowderSnowSubject {
                 fall_distance: self.fall_distance,
-                lava_walker: true,
+                leather_boots: self.extra.feet.as_deref() == Some("minecraft:leather_boots")
+                    && self.extra.armor[3].as_ref().is_none_or(|s| s.count > 0),
+                walkable_type: w
+                    .data
+                    .entity_has("minecraft:powder_snow_walkable_mobs", &self.kind.id),
+                lava_walker: self.kind.flags.lava_walker,
                 ..Default::default()
             }),
         };
@@ -1036,11 +1088,36 @@ impl Mob {
             speed: f64::from(0.15_f32),
         });
     }
+    /// `Entity.getFluidInteractionBox` and the fluids in it: the box less 0.001,
+    /// then the ridden boat's say (`AbstractBoat.modifyPassengerFluidInteractionBox`).
+    /// A boat that isn't underwater keeps only what lies above its top, and
+    /// all of a passenger it reaches the head of, so a mob sitting in a boat
+    /// on a lake is neither in the water (it burns in daylight, isn't pushed
+    /// by the flow) nor splashes.
+    fn fluid_interaction(&self, w: &MobWorld, boat: Option<crate::motion::RiddenBoat>) -> Fluids {
+        let b = self.bounds();
+        let Some(boat) = boat.filter(|boat| !boat.under_water) else {
+            return w.fluids(b, self.eye_y());
+        };
+        // `fluids` deflates the box by 0.001 itself: the deflated top against
+        // the boat's, and the deflated bottom raised to it, as vanilla does.
+        let (lo, hi) = (b.min_position(), b.max_position());
+        if boat.max_y >= hi.y - 0.001 {
+            return Fluids::default();
+        }
+        let lo = Vec3::new(lo.x, lo.y.max(boat.max_y - 0.001), lo.z);
+        w.fluids(Aabb::new(lo, hi), self.eye_y())
+    }
     /// Entity.updateFluidInteraction: the fluid state, then touching water
     /// resets the fall and entering it (after the first tick) splashes.
     pub(super) fn update_fluids(&mut self, w: &MobWorld, events: &mut Vec<MobEvent>) {
         let was_touching_water = self.fluids.in_water;
-        self.fluids = w.fluids(self.bounds(), self.eye_y());
+        let boat = self
+            .fluids
+            .boat
+            .filter(|(id, _)| self.extra.mount == Some(*id));
+        self.fluids = self.fluid_interaction(w, boat.map(|(_, b)| b));
+        self.fluids.boat = boat;
         // EntityFluidInteraction.applyCurrentTo: the flow pushes the mob.
         if (self.fluids.in_water || self.fluids.in_lava) && self.pushed_by_fluid() {
             self.velocity = w.pushed_by_currents(self.bounds(), self.velocity);

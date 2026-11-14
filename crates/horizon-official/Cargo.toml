@@ -19,6 +19,7 @@ horizon-official-servers = { path = "../horizon-official-servers" }
 horizon-discord = { path = "../horizon-discord" }
 # Native mods' videos in the world: libmpv, opened only when a mod plays one.
 horizon-mpv = { path = "../horizon-mpv" }
+horizon-perf-share = { path = "../horizon-perf-share" }
 log = "0.4"
 
 [build-dependencies]
