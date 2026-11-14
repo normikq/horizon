@@ -245,6 +245,8 @@ the runner to run them for real.
 `crates/horizon-client/examples/video_screen.rs` is a whole mod on these helpers, as a trait mod
 ([native-mods.md](native-mods.md#trait-mods-draft)): a `/video` command opens a 16:9 screen in front of the
 player and drives it (`open <file>`, `pause`, `play`, `seek <seconds>`, `volume <0-100>`, `close`, `info`).
+It is the horizon-video mod's `api/src/lib.rs` copied verbatim, with a `main` that registers the video backend
+and runs the game: change the mod, then copy it over the part above `main`.
 The example is a game of its own, so it needs the library beside its executable the way the launcher installs
 it:
 
