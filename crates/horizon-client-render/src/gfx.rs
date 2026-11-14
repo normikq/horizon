@@ -72,8 +72,8 @@ pub use entity_batch::{
     FLUID_OVERLAY, OIT_ENTITY, SHADOW_OVERLAY, TERRAIN_MODEL_CUTOUT_MIPPED_OVERLAY,
     TERRAIN_MODEL_CUTOUT_OVERLAY, TERRAIN_MODEL_SOLID_OVERLAY, TEXT_POLYGON_OFFSET_OVERLAY,
     TRANSLUCENT_GLINT_ITEM_OVERLAY, TRANSLUCENT_ITEM_OVERLAY, TRANSLUCENT_PARTICLE_OVERLAY,
-    WATER_MASK_OVERLAY, WORLD_TEXT_OVERLAY, WORLD_TEXT_POLYGON_OFFSET_OVERLAY, is_native_terrain,
-    mark_oit,
+    VIDEO_OVERLAY, WATER_MASK_OVERLAY, WORLD_TEXT_OVERLAY, WORLD_TEXT_POLYGON_OFFSET_OVERLAY,
+    is_native_terrain, mark_oit, video_layer,
 };
 use section_fade::{
     CHUNK_VISIBILITY_THRESHOLD, FadeInputs, chunk_visibility, fade_millis, section_instance,
@@ -252,6 +252,8 @@ mod sunrise_fan;
 mod timing;
 pub mod translucency;
 pub(crate) mod upload;
+mod video_textures;
+pub use video_textures::{Recycle as VideoRecycle, VideoFrame};
 mod view;
 mod visbuffer;
 mod wgsl_prefix;
@@ -1259,6 +1261,8 @@ pub struct Renderer {
     static_entity_indices: wgpu::Buffer,
     static_entity_index_quads: u32,
     entity_batch: EntityBatch,
+    /// The playing videos' textures (`native_video_open`).
+    video_textures: video_textures::VideoTextures,
     /// Ordinary entity models posed on the GPU; `None` without compute shaders.
     entity_skin: Option<entity_skin::EntitySkin>,
     group: wgpu::BindGroup,
@@ -3923,6 +3927,43 @@ impl Renderer {
                 },
             ],
         });
+        // The same resources with a playing video's texture in the atlas's place.
+        let video_textures = {
+            let layout = entity_bindings.clone();
+            let globals = globals.clone();
+            let sampler = video_textures::VideoTextures::sampler(&device);
+            let (lightmap_view, lightmap_sampler) =
+                (lightmap_view.clone(), lightmap_sampler.clone());
+            let (glint_view, glint_sampler) = (glint_view.clone(), glint_sampler.clone());
+            let glint_armor_view = glint_armor_view.clone();
+            let group_device = device.clone();
+            video_textures::VideoTextures::new(
+                &device,
+                Box::new(move |video: &wgpu::TextureView| {
+                    let view = wgpu::BindingResource::TextureView;
+                    let resources = [
+                        globals.as_entire_binding(),
+                        view(video),
+                        wgpu::BindingResource::Sampler(&sampler),
+                        view(&lightmap_view),
+                        wgpu::BindingResource::Sampler(&lightmap_sampler),
+                        view(&glint_view),
+                        wgpu::BindingResource::Sampler(&glint_sampler),
+                        view(&glint_armor_view),
+                    ];
+                    let entries: Vec<_> = resources
+                        .into_iter()
+                        .zip(0..)
+                        .map(|(resource, binding)| wgpu::BindGroupEntry { binding, resource })
+                        .collect();
+                    group_device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Video resources"),
+                        layout: &layout,
+                        entries: &entries,
+                    })
+                }),
+            )
+        };
         let static_entity_transform =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Static block-entity camera position"),
@@ -5167,6 +5208,7 @@ impl Renderer {
             static_entity_indices,
             static_entity_index_quads,
             entity_batch: EntityBatch::default(),
+            video_textures,
             entity_skin,
             group,
             fluid_group,
@@ -8001,6 +8043,22 @@ impl Renderer {
         // A scaled screenshot's frame never reached the window.
         rendered.map(|drawn| drawn && scaled.is_none())
     }
+    /// Shows `frame` as video slot `slot`'s picture, from the frame after it
+    /// is copied: its pixels are copied off this thread, and go back through
+    /// its `recycle`. False when it is refused (no such slot, a size that is
+    /// not a video's): nothing is shown.
+    pub fn video_frame(&self, slot: usize, frame: VideoFrame) -> bool {
+        self.video_textures.submit(slot, frame)
+    }
+    /// Whether video slot `slot` has a picture, or a frame on its way to one:
+    /// false in a renderer made after the video's last frame was given.
+    pub fn video_held(&self, slot: usize) -> bool {
+        self.video_textures.holds(slot)
+    }
+    /// Frees video slot `slot`'s texture and buffers: its video closed, or plays another file.
+    pub fn video_close(&mut self, slot: usize) {
+        self.video_textures.close(slot);
+    }
     /// Whether the device's loss callback has fired. A surface reconfigure
     /// alone cannot restore resources belonging to a lost device.
     pub fn device_lost(&self) -> bool {
@@ -8300,6 +8358,8 @@ impl Renderer {
             frame.block_flicker,
             frame.boss_darken,
         );
+        // The videos' new frames, ahead of the world pass that shows them.
+        self.video_textures.prepare(&mut encoder);
         let views = self.views(frame);
         let pose = frame.bob * frame.spin;
         let view_proj = views.primary().view_proj(pose);
@@ -9553,6 +9613,9 @@ impl Renderer {
             oit_on,
         );
         self.entity_batch.append_shadow_only(frame.shadow_only);
+        // The videos' quads close the materials, slot by slot.
+        let video_quads = self.entity_batch.video_quads;
+        let all_video_quads: u32 = video_quads.iter().sum();
         // The posed models' vertices come first: the ordinary entities' draw takes them in.
         let posed = if pack_skin {
             0
@@ -9576,7 +9639,8 @@ impl Renderer {
             + world_text_offset_quads
             + native_solid_quads
             + native_cutout_quads
-            + native_cutout_mipped_quads;
+            + native_cutout_mipped_quads
+            + all_video_quads;
         laps.lap("r_draw_lists");
         // Where the tail of materials the classic and the improved passes
         // both draw ends: the shadows, particles and items count back from it.
@@ -9587,7 +9651,8 @@ impl Renderer {
             - world_text_offset_quads
             - native_solid_quads
             - native_cutout_quads
-            - native_cutout_mipped_quads;
+            - native_cutout_mipped_quads
+            - all_video_quads;
         let native_clouds = self.native.as_ref().is_none_or(|n| n.vanilla_clouds);
         let cloud_quads = if let Some(input) = frame.clouds.as_ref().filter(|_| native_clouds) {
             let (rebuilt, uniform) =
@@ -11024,6 +11089,25 @@ impl Renderer {
                 }
                 pass.set_bind_group(0, &self.group, &[]);
             }
+            // A playing video's quads (`native_draw_video`): entities whose atlas is the
+            // video's own texture. A slot with no frame in its texture yet draws nothing.
+            let mut first_video = world_quads - all_video_quads;
+            for (slot, quads) in video_quads.into_iter().enumerate() {
+                let first = (first_video * 4) as i32;
+                first_video += quads;
+                let Some(group) = self.video_textures.bind_group(slot).filter(|_| quads > 0) else {
+                    continue;
+                };
+                pass.set_pipeline(warped.map_or(&self.entity_pipeline, |w| &w.entities));
+                pass.set_bind_group(0, group, &[]);
+                pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                pass.draw_indexed(0..quads * 6, first, 0..1);
+                if light_marks(self.output.frame.format, self.hdr.is_some()) {
+                    pass.set_pipeline(hdr_entity_mark);
+                    pass.draw_indexed(0..quads * 6, first, 0..1);
+                }
+                pass.set_bind_group(0, &self.group, &[]);
+            }
             if text_quads > 0 && !oit_on {
                 pass.set_pipeline(warped.map_or(&self.text_polygon_offset_pipeline, |w| &w.text));
                 pass.set_bind_group(0, &self.entity_group, &[]);
@@ -11073,8 +11157,11 @@ impl Renderer {
             // Native terrain models use the block sprite arrays with their own
             // alpha/mipmap policies and ordinary opaque depth. Storage follows
             // the existing materials without moving their indices or frame tails.
-            let mut first =
-                world_quads - native_solid_quads - native_cutout_quads - native_cutout_mipped_quads;
+            let mut first = world_quads
+                - native_solid_quads
+                - native_cutout_quads
+                - native_cutout_mipped_quads
+                - all_video_quads;
             for (i, count) in [
                 native_solid_quads,
                 native_cutout_quads,

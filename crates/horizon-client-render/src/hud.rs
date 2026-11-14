@@ -918,7 +918,7 @@ impl HudAtlas {
             crate::minimap::SIZE as u32,
             Vec::new(),
         ));
-        // A mod's own image and video (`video_slots`), only when a mod is loaded.
+        // A mod's own image (`video_slots`), only when a mod is loaded.
         if mod_image {
             crate::video_slots::mod_slots(images);
         }
@@ -2880,7 +2880,6 @@ impl HudRenderer {
         patches: &[crate::font::Patch],
     ) {
         if let Some(texture) = &self.atlas_texture {
-            let started = std::time::Instant::now();
             for p in patches {
                 if p.x.saturating_add(p.width) <= texture.width()
                     && p.y.saturating_add(p.height) <= texture.height()
@@ -2903,7 +2902,6 @@ impl HudRenderer {
                     );
                 }
             }
-            crate::video_slots::uploaded(patches, started);
         }
     }
     /// Stage the batch's atlas patches, vertices and uniform: before the

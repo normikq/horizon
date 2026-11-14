@@ -2,22 +2,24 @@
 //! (docs/native-libraries.md): libmpv, which the mod declared and the
 //! launcher installed beside the game, decodes and renders on its own
 //! threads, through the video backend a higher layer registers
-//! (`horizon_hooks::video`: `horizon-mpv`, from horizon-official); each new frame is a patch into the video's atlas
-//! slot (`video_slots`), and `native_draw_video` draws that slot on a quad
-//! from `native_block_entity_submit`. mpv's sound is captured, not played
+//! (`horizon_hooks::video`: `horizon-mpv`, from horizon-official); each new frame goes to the
+//! renderer, which copies it into the video's own texture off this thread
+//! (`Renderer::video_frame`), and `native_draw_video` draws that texture on a quad
+//! from `native_block_entity_submit` or `world_submit`. mpv's sound is captured, not played
 //! by mpv: the mod takes it (`native_video_audio*`) and plays it through the
 //! game's mixer (`push_voices`), where it is placed in the world.
 //!
-//! The game's thread pays for taking a finished frame and staging its
-//! pixels; `NativeVideoState` says what both cost.
+//! The game's thread pays for taking a finished frame and for handing it to
+//! the GPU, not for its pixels; `NativeVideoState` says what both cost.
 
 use crate::game::{Game, native_block_entity_draw::BlockEntityDraw};
+use horizon_client::gfx::VideoFrame;
 use horizon_client::video_slots::{
-    NativeVideoState, VIDEO_HEIGHT, VIDEO_SLOTS, VIDEO_WIDTH, upload_micros, video_slot_sprite,
+    NativeVideoState, VIDEO_HEIGHT, VIDEO_SLOTS, VIDEO_WIDTH, upload_micros,
 };
 use horizon_hooks::video::{Library, Options, Player};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 /// The library's name in a mod's `native-libraries.toml`.
@@ -27,7 +29,7 @@ struct Video {
     player: Box<dyn Player>,
     /// The id the mod was given: its slot and a generation ([`video_id`]).
     id: u32,
-    /// The size of the frame of this video in its slot; none before one is.
+    /// The size of the frame of this video the renderer was last given; none before one is.
     shown: Option<(u32, u32)>,
 }
 
@@ -49,26 +51,44 @@ pub(in crate::game) struct Videos {
     /// libmpv, opened and checked when the first video is: or why it was not.
     library: Option<Result<Arc<dyn Library>, String>>,
     slots: [Option<Video>; VIDEO_SLOTS],
-    /// The atlas the slots' frames were written to: a reload starts it empty.
-    atlas: u64,
+    /// Frame buffers the renderer is done copying, with their video's id:
+    /// they go back to that video's player (`recycle_frame`), which renders
+    /// into them again. Both ends, made with the first frame.
+    recycled: Option<(Recycled, mpsc::Receiver<(u32, Vec<u8>)>)>,
     /// Microseconds the last frame spent taking the videos' frames.
     pump_micros: u64,
     /// The last generation given to an id; never 0, so no id is a bare slot number.
     generation: u32,
 }
 
+type Recycled = mpsc::Sender<(u32, Vec<u8>)>;
+
 /// A surface no larger than a video slot, with pixels to show.
 fn fits(width: u32, height: u32) -> bool {
     (1..=VIDEO_WIDTH).contains(&width) && (1..=VIDEO_HEIGHT).contains(&height)
 }
 
-/// The corners of a `width` x `height` frame in its slot, as fractions of the
-/// slot, half a pixel in: the slot's unused part is never sampled.
+/// The corners of a `width` x `height` frame in its texture, which is the
+/// frame's size, half a pixel in: the centres of its outermost pixels.
 fn frame_uv(width: u32, height: u32) -> [[f32; 2]; 4] {
-    let (u0, v0) = (0.5 / VIDEO_WIDTH as f32, 0.5 / VIDEO_HEIGHT as f32);
-    let u1 = (width as f32 - 0.5) / VIDEO_WIDTH as f32;
-    let v1 = (height as f32 - 0.5) / VIDEO_HEIGHT as f32;
+    let (w, h) = (width as f32, height as f32);
+    let (u0, v0) = (0.5 / w, 0.5 / h);
+    let (u1, v1) = ((w - 0.5) / w, (h - 0.5) / h);
     [[u0, v0], [u0, v1], [u1, v1], [u1, v0]]
+}
+
+/// The part `uv` ([u0, v0, u1, v1], 0 to 1) of a `width` x `height` frame, as
+/// the corners of a quad in the frame's texture (`frame_uv`'s order).
+fn part_uv(width: u32, height: u32, uv: [f32; 4]) -> [[f32; 2]; 4] {
+    let [tl, bl, br, _tr] = frame_uv(width, height);
+    let du = br[0] - tl[0];
+    let dv = bl[1] - tl[1];
+    [
+        [tl[0] + du * uv[0], tl[1] + dv * uv[1]],
+        [tl[0] + du * uv[0], tl[1] + dv * uv[3]],
+        [tl[0] + du * uv[2], tl[1] + dv * uv[3]],
+        [tl[0] + du * uv[2], tl[1] + dv * uv[1]],
+    ]
 }
 
 // Native mods use these; nothing in Horizon does.
@@ -136,10 +156,6 @@ impl Game<'_> {
         let slot = (0..VIDEO_SLOTS)
             .find(|&i| self.extras.videos.slots[i].is_none())
             .ok_or_else(|| format!("{VIDEO_SLOTS} videos are playing already"))?;
-        let known = video_slot_sprite(slot).is_some_and(|s| self.gui.atlas.sprites.contains_key(s));
-        if !known {
-            return Err("this game was built without native mods: it has no video surfaces".into());
-        }
         let options = Options {
             looped,
             capture_audio: true,
@@ -163,9 +179,14 @@ impl Game<'_> {
         video: u32,
         path: &str,
     ) -> Result<(), String> {
+        let slot = video_slot(video);
         let video = self.video_mut(video).ok_or("no such video surface")?;
         video.player.load(Path::new(path))?;
         video.shown = None;
+        // The file before it is not shown on, at whatever size it had.
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.video_close(slot);
+        }
         Ok(())
     }
 
@@ -196,8 +217,12 @@ impl Game<'_> {
         if self.video(video).is_none() {
             return false;
         }
+        let slot = video_slot(video);
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.video_close(slot);
+        }
         // Dropping the player never waits for mpv: it is torn down on its own thread.
-        self.extras.videos.slots[video_slot(video)].take().is_some()
+        self.extras.videos.slots[slot].take().is_some()
     }
 
     /// What `video` is doing and what its frames cost; none for no such
@@ -359,25 +384,14 @@ impl Game<'_> {
         let Some((v, (width, height))) = self.video(video).and_then(|v| Some((v, v.shown?))) else {
             return false;
         };
-        let sprite = video_slot_sprite(video_slot(v.id));
-        let Some(rect) = sprite.and_then(|s| self.gui.atlas.sprites.get(s)).copied() else {
-            return false;
-        };
-        let [tl, bl, br, _tr] = frame_uv(width, height);
-        let du = br[0] - tl[0];
-        let dv = bl[1] - tl[1];
-        let slice_uv = [
-            [tl[0] + du * uv[0], tl[1] + dv * uv[1]],
-            [tl[0] + du * uv[0], tl[1] + dv * uv[3]],
-            [tl[0] + du * uv[2], tl[1] + dv * uv[3]],
-            [tl[0] + du * uv[2], tl[1] + dv * uv[1]],
-        ];
-        draw.bright_quad(corners, slice_uv, rect);
+        draw.video_quad(video_slot(v.id), corners, part_uv(width, height, uv));
         true
     }
 
-    /// Once a frame: each video's new frame goes to its atlas slot. Leaving
-    /// the world for the title closes the videos.
+    /// Once a frame: each video's new frame goes to the renderer, which
+    /// copies it into the video's texture off this thread, and the buffers it
+    /// is done with go back to their players. Leaving the world for the title
+    /// closes the videos.
     pub(in crate::game) fn videos_frame(&mut self) {
         let videos = &mut self.extras.videos;
         if videos.slots.iter().all(Option::is_none) {
@@ -385,16 +399,30 @@ impl Game<'_> {
         }
         if self.title.is_some() {
             videos.slots = Default::default();
+            if let Some(renderer) = self.renderer.as_mut() {
+                (0..VIDEO_SLOTS).for_each(|slot| renderer.video_close(slot));
+            }
             return;
         }
         let started = Instant::now();
-        let atlas = &self.gui.atlas;
-        if videos.atlas != atlas.revision {
-            // A new atlas has empty slots. A playing video fills its slot with
-            // its next frame; a paused one is asked for its frame again by a
-            // seek to where it is (its sound is paused too: nothing is lost).
-            videos.atlas = atlas.revision;
-            for video in videos.slots.iter_mut().flatten() {
+        let (back, recycled) = videos.recycled.get_or_insert_with(mpsc::channel);
+        // A buffer of a video closed since is dropped: its player is gone.
+        for (id, rgba) in recycled.try_iter() {
+            let video = videos.slots.get(video_slot(id)).and_then(Option::as_ref);
+            if let Some(video) = video.filter(|v| v.id == id) {
+                video.player.recycle_frame(rgba);
+            }
+        }
+        // Without a renderer the frames wait in their players.
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        for (slot, video) in videos.slots.iter_mut().enumerate() {
+            let Some(video) = video else { continue };
+            if video.shown.is_some() && !renderer.video_held(slot) {
+                // A new renderer has no picture of it. A playing video gives
+                // its next frame; a paused one is asked for its frame again by
+                // a seek to where it is (its sound is paused too: nothing is lost).
                 video.shown = None;
                 if video.player.paused()
                     && let Some(position) = video.player.position()
@@ -402,17 +430,12 @@ impl Game<'_> {
                     let _ = video.player.seek(position);
                 }
             }
-        }
-        let (w, h) = (atlas.width as f32, atlas.height as f32);
-        for (slot, video) in videos.slots.iter_mut().enumerate() {
-            let Some(video) = video else { continue };
-            let rect = video_slot_sprite(slot).and_then(|s| atlas.sprites.get(s));
-            let (Some(rect), Some(frame)) = (rect, video.player.take_frame()) else {
+            let Some(frame) = video.player.take_frame() else {
                 continue;
             };
             let (width, height) = (frame.width, frame.height);
             // The size comes with the pixels; a frame that does not match it
-            // or the slot is never uploaded.
+            // or the slot is never shown.
             if !fits(width, height) || frame.rgba.len() != width as usize * height as usize * 4 {
                 log::warn!(
                     "a {width}x{height} video frame of {} bytes was not shown",
@@ -421,14 +444,18 @@ impl Game<'_> {
                 video.player.recycle_frame(frame.rgba);
                 continue;
             }
-            self.map_patches.push(horizon_client::font::Patch {
-                x: (rect.u0 * w).round() as u32,
-                y: (rect.v0 * h).round() as u32,
+            let (id, back) = (video.id, back.clone());
+            let frame = VideoFrame {
                 width,
                 height,
                 rgba: frame.rgba,
-            });
-            video.shown = Some((width, height));
+                recycle: Box::new(move |rgba| {
+                    let _ = back.send((id, rgba));
+                }),
+            };
+            if renderer.video_frame(slot, frame) {
+                video.shown = Some((width, height));
+            }
         }
         videos.pump_micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
     }
@@ -457,22 +484,35 @@ mod tests {
         assert!((0..VIDEO_SLOTS as u32).all(|slot| slot != first && slot != next));
     }
 
+    /// A frame's UVs sample the centres of its outermost pixels.
     #[test]
-    fn a_frame_is_sampled_inside_its_own_pixels() {
+    fn a_frame_is_sampled_at_its_outermost_pixel_centres() {
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-7;
         let [top_left, bottom_left, bottom_right, top_right] = frame_uv(640, 360);
-        // Texel centres of the frame's first and last pixels, as slot fractions.
-        assert_eq!(
-            top_left,
-            [0.5 / VIDEO_WIDTH as f32, 0.5 / VIDEO_HEIGHT as f32]
-        );
-        assert_eq!(
-            bottom_right,
-            [639.5 / VIDEO_WIDTH as f32, 359.5 / VIDEO_HEIGHT as f32]
-        );
+        assert!(near(top_left[0], 0.00078125) && near(top_left[1], 0.0013888889));
+        assert!(near(bottom_right[0], 0.99921875) && near(bottom_right[1], 0.9986111));
         assert_eq!(bottom_left, [top_left[0], bottom_right[1]]);
         assert_eq!(top_right, [bottom_right[0], top_left[1]]);
-        // A full-size frame stays inside the slot.
-        let [_, _, corner, _] = frame_uv(VIDEO_WIDTH, VIDEO_HEIGHT);
-        assert!(corner[0] < 1.0 && corner[1] < 1.0);
+        assert_eq!(frame_uv(1, 1), [[0.5, 0.5]; 4]);
+    }
+
+    /// A sub-rectangle's UVs map proportionally within the frame's pixel centres.
+    #[test]
+    fn a_part_of_a_frame_is_a_part_of_its_texture() {
+        assert_eq!(
+            part_uv(1000, 500, [0.0, 0.0, 1.0, 1.0]),
+            frame_uv(1000, 500)
+        );
+        let near = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        let got = part_uv(1000, 500, [0.25, 0.5, 0.75, 1.0]);
+        let expected = [
+            [0.25025, 0.5],
+            [0.25025, 0.999],
+            [0.74975, 0.999],
+            [0.74975, 0.5],
+        ];
+        for (g, e) in got.iter().zip(expected) {
+            assert!(near(g[0], e[0]) && near(g[1], e[1]));
+        }
     }
 }

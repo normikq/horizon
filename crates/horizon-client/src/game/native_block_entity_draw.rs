@@ -14,7 +14,7 @@ use horizon_client::{
     block_entity_render::{TextCall, diffuse, diffuse_lights, text_vertices, vertex_light},
     containers::{BlockEntity, ModRevision},
     fast_hash::FxHashMap,
-    gfx::Cull,
+    gfx::{Cull, video_layer},
     hud::Rect,
     items::ItemStack,
     mesher::Vertex,
@@ -282,18 +282,16 @@ impl BlockEntityDraw {
         }
     }
 
-    /// A quad that shows its texture as it is, whatever the light on the
-    /// block and the side it faces: a screen (`native_draw_video`).
-    pub(super) fn bright_quad(&mut self, corners: [[f32; 3]; 4], uv: [[f32; 2]; 4], sprite: Rect) {
+    /// A quad that shows video slot `slot`'s picture as it is, whatever the
+    /// light on the block and the side it faces: a screen
+    /// (`native_draw_video`). `uv` is in the video's own texture, not the atlas.
+    pub(super) fn video_quad(&mut self, slot: usize, corners: [[f32; 3]; 4], uv: [[f32; 2]; 4]) {
         let pose = self.pose();
         for (corner, uv) in corners.into_iter().zip(uv) {
             self.vertices.push(Vertex {
                 pos: pose.transform_point3(Vec3::from_array(corner)).to_array(),
-                uv: [
-                    sprite.u0 + (sprite.u1 - sprite.u0) * uv[0],
-                    sprite.v0 + (sprite.v1 - sprite.v0) * uv[1],
-                ],
-                layer: 0,
+                uv,
+                layer: video_layer(slot),
                 color: u32::MAX,
                 light: 240 | 240 << 8,
                 normal: [0; 4],
@@ -1202,5 +1200,34 @@ mod tests {
         kept.sweep(200);
         assert!(!kept.entries.contains_key(&gone));
         assert!(kept.get(seen, KEY, m, 200).is_some());
+    }
+
+    /// A video quad carries its slot in `layer` and keeps its own UVs unshaded and fullbright.
+    #[test]
+    fn a_video_quad_carries_its_slot_and_its_own_uv() {
+        let mut d = draw();
+        let corners = [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ];
+        let uv = [[0.1, 0.2], [0.1, 0.8], [0.9, 0.8], [0.9, 0.2]];
+        d.video_quad(1, corners, uv);
+        assert_eq!(d.vertices.len(), 4);
+        let expected_pos = [
+            [10.0, 1.0, 0.0],
+            [10.0, 0.0, 0.0],
+            [11.0, 0.0, 0.0],
+            [11.0, 1.0, 0.0],
+        ];
+        for ((v, pos), uv) in d.vertices.iter().zip(expected_pos).zip(uv) {
+            assert_eq!(v.pos, pos);
+            assert_eq!(v.uv, uv);
+            assert_eq!(v.layer, 46 | 1 << 16);
+            assert_eq!(v.color, u32::MAX);
+            assert_eq!(v.light, 240 | 240 << 8);
+            assert_eq!(v.normal, [0; 4]);
+        }
     }
 }

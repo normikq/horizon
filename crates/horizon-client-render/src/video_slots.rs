@@ -1,30 +1,21 @@
-//! The atlas slots only a game built with native mods holds: a mod's own
-//! image (`native_mod_image`) and the frames of the video it plays
+//! What a game built with native mods holds for them: the atlas slot of a
+//! mod's own image (`native_mod_image`), and the videos it plays
 //! (`native_video_open`, docs/native-libraries.md).
 //!
-//! A video slot is written like the minimap's: the frame is a patch into
-//! the shared atlas, so `native_draw_video` draws it in the world with the
-//! entity batch and no pipeline of its own.
+//! A video is not in the atlas: each has a texture of its own, the size of
+//! its frames and only while it plays (`gfx/video_textures.rs`), which
+//! `native_draw_video` draws in the world with the entity batch.
 
 use crate::hud::{MOD_IMAGE_SIZE, MOD_IMAGE_SPRITE};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// How many videos play at once. Each slot costs ~33 MiB of atlas at 4K.
+/// How many videos play at once. Each costs ~33 MiB of GPU memory at 4K
+/// while it plays, and twice that in staging buffers.
 pub const VIDEO_SLOTS: usize = 2;
 /// A video frame's largest size: 4K UHD (3840x2160).
 pub const VIDEO_WIDTH: u32 = 3840;
 pub const VIDEO_HEIGHT: u32 = 2160;
-
-/// The atlas sprite of video slot `slot` (`horizon/video{slot}`).
-pub fn video_slot_sprite(slot: usize) -> Option<&'static str> {
-    static NAMES: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
-        (0..VIDEO_SLOTS)
-            .map(|i| format!("horizon/video{i}"))
-            .collect()
-    });
-    NAMES.get(slot).map(String::as_str)
-}
 
 /// The empty slots of a game with native mods, for `HudAtlas::slots`.
 pub(crate) fn mod_slots(images: &mut Vec<(String, u32, u32, Vec<u8>)>) {
@@ -34,10 +25,6 @@ pub(crate) fn mod_slots(images: &mut Vec<(String, u32, u32, Vec<u8>)>) {
         MOD_IMAGE_SIZE,
         Vec::new(),
     ));
-    for slot in 0..VIDEO_SLOTS {
-        let name = video_slot_sprite(slot).unwrap_or_default();
-        images.push((name.into(), VIDEO_WIDTH, VIDEO_HEIGHT, Vec::new()));
-    }
 }
 
 /// What a video is doing (`native_video_state`).
@@ -65,7 +52,7 @@ pub struct NativeVideoState {
     /// Microseconds the last frame took to render, on the video's own thread.
     pub render_micros: u64,
     /// Microseconds of the game's thread the last frame spent taking the
-    /// videos' frames, and staging their pixels for the GPU.
+    /// videos' frames, and handing a new one to the GPU.
     pub pump_micros: u64,
     pub upload_micros: u64,
     /// Average RGB color of the current frame, for ambient dynamic lighting.
@@ -74,21 +61,18 @@ pub struct NativeVideoState {
     pub colors: Option<[[u8; 3]; 3]>,
 }
 
-/// A patch this large is a video frame or a mod's image, not a glyph or a map.
-const LARGE_PATCH: usize = 256 * 1024;
 static UPLOAD_MICROS: AtomicU64 = AtomicU64::new(0);
 
-/// Notes what staging `patches` took since `started`, when a large one was
-/// among them (`HudRenderer::upload_patches`): the game's side of a video
+/// Notes what handing the videos' frames to the GPU took the window's thread
+/// since `started` (`VideoTextures::prepare`): the game's side of a video
 /// frame's cost.
-pub(crate) fn uploaded(patches: &[crate::font::Patch], started: Instant) {
-    if patches.iter().any(|p| p.rgba.len() >= LARGE_PATCH) {
-        let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-        UPLOAD_MICROS.store(micros, Ordering::Relaxed);
-    }
+pub(crate) fn uploaded(started: Instant) {
+    let micros = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+    UPLOAD_MICROS.store(micros, Ordering::Relaxed);
 }
 
-/// Microseconds the last frame with a large patch spent staging its patches.
+/// Microseconds the window's thread spent on the last frame that showed a
+/// new video frame: recording its copy, not copying its pixels.
 pub fn upload_micros() -> u64 {
     UPLOAD_MICROS.load(Ordering::Relaxed)
 }
@@ -96,38 +80,29 @@ pub fn upload_micros() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hud::HudAtlas;
-    use std::path::Path;
 
-    /// The video slots are paid only by a game with a native mod loaded.
+    /// Native mod images take one atlas slot while video slots take none.
     #[test]
-    fn the_video_slots_exist_only_when_a_mod_is_loaded() {
-        let root = Path::new("/nonexistent/horizon-test-assets");
-        let plain = HudAtlas::build(root).unwrap();
-        let with_mod = HudAtlas::build_over_with_image(root, root, true).unwrap();
-        for slot in 0..VIDEO_SLOTS {
-            let name = video_slot_sprite(slot).unwrap();
-            assert!(!plain.sprites.contains_key(name));
-            let rect = with_mod.sprites[name];
-            assert_eq!((rect.w, rect.h), (VIDEO_WIDTH, VIDEO_HEIGHT));
-        }
-        assert!(video_slot_sprite(VIDEO_SLOTS).is_none());
+    fn the_videos_take_no_atlas_slots() {
+        let root = std::path::Path::new("/nonexistent/horizon-test-assets");
+        let plain = crate::hud::HudAtlas::build(root).unwrap();
+        let with_mod = crate::hud::HudAtlas::build_over_with_image(root, root, true).unwrap();
+
+        assert!(with_mod.sprites.contains_key(crate::hud::MOD_IMAGE_SPRITE));
+        assert!(!plain.sprites.contains_key(crate::hud::MOD_IMAGE_SPRITE));
+        assert!(
+            !with_mod
+                .sprites
+                .keys()
+                .any(|k| k.starts_with("horizon/video"))
+        );
+        assert_eq!(with_mod.sprites.len(), plain.sprites.len() + 1);
     }
 
+    /// Recording an upload stores the elapsed microseconds since it started.
     #[test]
-    fn only_a_large_patch_is_timed() {
-        let patch = |bytes: usize| crate::font::Patch {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 1,
-            rgba: vec![0; bytes],
-        };
-        UPLOAD_MICROS.store(7, Ordering::Relaxed);
-        uploaded(&[patch(64)], Instant::now());
-        assert_eq!(upload_micros(), 7);
-        let started = Instant::now() - std::time::Duration::from_millis(2);
-        uploaded(&[patch(64), patch(LARGE_PATCH)], started);
+    fn the_upload_time_is_what_passed_since_it_started() {
+        uploaded(Instant::now() - std::time::Duration::from_millis(2));
         assert!(upload_micros() >= 2000);
     }
 }

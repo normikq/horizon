@@ -36,11 +36,15 @@ So the pieces are:
   that plays no video never loads it. The engine does not depend on it: `horizon-hooks` names the video backend
   (`horizon_hooks::video`), `horizon-mpv` implements it (`horizon_mpv::hooks::HOOKS`), and horizon-official
   registers it, as it does Play with Friends' tunnel. A game without it opens no video and says why.
-- **Video slots** (`crates/horizon-client-render/src/video_slots.rs`): two atlas slots of `VIDEO_WIDTH` x
-  `VIDEO_HEIGHT`, `horizon/video0` and `horizon/video1`, present only in a game built with native mods, like the
-  mod image slot.
-- **The helpers** (`crates/horizon-client/src/game/extras/video.rs`) open a surface, drive the playback and draw
-  the slot on a quad.
+- **Video textures** (`crates/horizon-client-render/src/gfx/video_textures.rs`): each of the `VIDEO_SLOTS`
+  videos has a texture of its own, the size of its frames (at most `VIDEO_WIDTH` x `VIDEO_HEIGHT`) and only
+  while it plays; a video is not in the atlas. A thread of its own (`video-upload`) copies each frame into a
+  mapped staging buffer, two a slot, and the game's thread only records one buffer-to-texture copy in the
+  frame's commands, ahead of the world pass: it never touches the pixels, and one texture a slot cannot tear.
+  The quads are entities with the overlay `VIDEO_OVERLAY`, drawn by the entity pipeline with the video's
+  texture in the atlas's place.
+- **The helpers** (`crates/horizon-client/src/game/extras/video.rs`) open a surface, drive the playback, hand
+  each frame to the renderer (`Renderer::video_frame`) and draw the video on a quad.
 - **The launcher** (`launcher/src/native_mods/libraries.rs`) reads the declaration, checks the file's hash and
   installs it beside the built game.
 
@@ -235,8 +239,12 @@ that call waits until the frame is due. That wait is what paces the video, and i
 without waiting, after a seek while paused, took 0.5 to 1.3 ms there.
 
 `NativeVideoState` reports the costs in the game: `render_micros` (the player's thread, wait included),
-`pump_micros` (the game's thread taking the frames) and `upload_micros` (the game's thread staging the frame's
-patch). The `video_screen` example logs them every five seconds.
+`pump_micros` (the game's thread taking the frames) and `upload_micros` (the game's thread recording the
+frame's copy to its texture). The `video_screen` example logs them every five seconds.
+
+The game's-thread copies measured above are from when a frame was a patch into the atlas, staged on the game's
+thread. The pixels are now copied on the `video-upload` thread, so the game's thread no longer pays by the
+frame's size.
 
 ## Trying it
 

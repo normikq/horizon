@@ -1,5 +1,6 @@
 //! Stable entity material grouping with renderer-owned, reusable CPU scratch.
 use super::Vertex;
+use crate::video_slots::VIDEO_SLOTS;
 
 /// Entity materials by a quad's overlay (`Vertex::layer`), in draw order:
 /// ordinary entities, world text drawn with a depth bias (35,
@@ -24,7 +25,16 @@ pub const TERRAIN_MODEL_CUTOUT_MIPPED_OVERLAY: u32 = 44;
 /// (`additive_translucent`): fog tints its colour as vanilla's particle shader does, which the
 /// other additive geometry does not take.
 pub const ADDITIVE_PARTICLE_OVERLAY: u32 = 45;
-/// Native terrain-array UV/payloads must never enter a shared-atlas shader-pack pass.
+/// A playing video's picture (`native_draw_video`): the quad samples the video's own texture
+/// (`gfx/video_textures.rs`), with its slot in bits 16 to 23 as submitted
+/// ([`video_layer`]). `EntityBatch::update` takes the slot out again, where entity.wgsl reads
+/// the HDR tier: a video is drawn as bright as an ordinary entity, whichever its slot.
+pub const VIDEO_OVERLAY: u32 = 46;
+/// The layer of a quad showing video slot `slot`.
+pub fn video_layer(slot: usize) -> u32 {
+    VIDEO_OVERLAY | ((slot as u32) << 16)
+}
+/// Native terrain-array and video UV/payloads must never enter a shared-atlas shader-pack pass.
 pub fn is_native_terrain(layer: u32) -> bool {
     matches!(
         layer & 0xffff,
@@ -32,6 +42,7 @@ pub fn is_native_terrain(layer: u32) -> bool {
             | TERRAIN_MODEL_SOLID_OVERLAY
             | TERRAIN_MODEL_CUTOUT_OVERLAY
             | TERRAIN_MODEL_CUTOUT_MIPPED_OVERLAY
+            | VIDEO_OVERLAY
     )
 }
 /// Sorted depth-writing still fluid, sampling terrain sprite arrays rather than the shared atlas.
@@ -80,12 +91,16 @@ pub const WORLD_TEXT_OVERLAY: u32 = 39;
 pub const WORLD_TEXT_POLYGON_OFFSET_OVERLAY: u32 = 40;
 
 /// The material of a quad by its overlay (`MATERIALS` order): the overlay is the layer's low 16
-/// bits, as entity.wgsl reads it; HDR output's tier rides in the high ones.
+/// bits, as entity.wgsl reads it; HDR output's tier rides in the high ones. A video's quads
+/// follow the materials, one bucket a slot (a slot there is none of counts as the last).
 fn material(layer: u32, oit: bool) -> usize {
     match layer & 0xffff {
         TERRAIN_MODEL_SOLID_OVERLAY => return 13,
         TERRAIN_MODEL_CUTOUT_OVERLAY => return 14,
         TERRAIN_MODEL_CUTOUT_MIPPED_OVERLAY => return 15,
+        VIDEO_OVERLAY => {
+            return MATERIALS + (((layer >> 16) & 0xff) as usize).min(VIDEO_SLOTS - 1);
+        }
         _ => {}
     }
     if layer & 0xffff == FLUID_OVERLAY {
@@ -114,8 +129,11 @@ pub(super) struct EntityBatch {
     // Runs of consecutive quads of one material (first quad, quad count): a
     // model's quads share one, so whole runs are copied at once. Cleared each
     // frame, keeping their storage.
-    runs: [Vec<(usize, usize)>; MATERIALS],
+    runs: [Vec<(usize, usize)>; MATERIALS + VIDEO_SLOTS],
     pub(super) combined: Vec<Vertex>,
+    /// The quads of each video slot the last `update` took, after the last
+    /// material and in the slots' order.
+    pub(super) video_quads: [u32; VIDEO_SLOTS],
     /// Additive quads tagged `OIT_ENTITY` that the last `update` moved into the
     /// last material (improved transparency on): the dragon's eyes, which share
     /// the additive buffer with its rays.
@@ -140,7 +158,7 @@ impl EntityBatch {
         for runs in &mut self.runs {
             runs.clear();
         }
-        let mut counts = [0usize; MATERIALS];
+        let mut counts = [0usize; MATERIALS + VIDEO_SLOTS];
         let mut start = 0;
         while start < quads.len() {
             let kind = material(quads[start][0].layer, oit);
@@ -201,12 +219,24 @@ impl EntityBatch {
                 });
         }
         // Native solid/cutout models are depth writing and keep their submission order.
-        for runs in &self.runs[13..] {
+        for runs in &self.runs[13..MATERIALS] {
             for &(first, count) in runs {
                 self.combined
                     .extend_from_slice(&entities[first * 4..(first + count) * 4]);
             }
         }
+        // The videos, slot by slot: each is a draw with its own texture. The
+        // slot leaves the layer, where the shader reads the HDR tier.
+        for runs in &self.runs[MATERIALS..] {
+            for &(first, count) in runs {
+                let quads = &entities[first * 4..(first + count) * 4];
+                self.combined.extend(quads.iter().map(|v| Vertex {
+                    layer: VIDEO_OVERLAY,
+                    ..*v
+                }));
+            }
+        }
+        self.video_quads = std::array::from_fn(|slot| counts[MATERIALS + slot] as u32);
         if self.moved_additive == 0 {
             self.combined.extend_from_slice(additive);
         } else {
@@ -218,7 +248,7 @@ impl EntityBatch {
         }
         self.combined.extend_from_slice(hand);
         self.combined.extend_from_slice(see_through);
-        counts.map(|count| count as u32)
+        std::array::from_fn(|material| counts[material] as u32)
     }
 }
 
@@ -551,5 +581,67 @@ mod tests {
                         .sum::<usize>()
             );
         }
+    }
+
+    /// Video quads follow every material bucket slot by slot with their slot bits stripped.
+    #[test]
+    fn videos_follow_every_material_slot_by_slot_without_their_slot_bits() {
+        let quad = |layer, x| {
+            [Vertex {
+                layer,
+                pos: [x, 0.0, 0.0],
+                ..geometry(1, false)[0]
+            }; 4]
+        };
+        let entities: Vec<_> = [
+            (video_layer(1), 1.0),
+            (0, 2.0),
+            (video_layer(0), 3.0),
+            (FLUID_OVERLAY, 4.0),
+            (TERRAIN_MODEL_SOLID_OVERLAY, 5.0),
+            (video_layer(1), 6.0),
+        ]
+        .into_iter()
+        .flat_map(|(layer, x)| quad(layer, x))
+        .collect();
+        let additive = quad(0, 7.0);
+        let hand = quad(0, 8.0);
+        let see_through = quad(0, 9.0);
+        let mut batch = EntityBatch::default();
+        let counts = batch.update(&entities, &additive, &hand, &see_through, true);
+        assert_eq!(counts, [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0]);
+        assert_eq!(batch.video_quads, [1, 2]);
+        let xs: Vec<_> = batch.combined.iter().step_by(4).map(|v| v.pos[0]).collect();
+        assert_eq!(xs, [2.0, 4.0, 5.0, 3.0, 1.0, 6.0, 7.0, 8.0, 9.0]);
+        assert!(batch.combined[12..24].iter().all(|v| v.layer == 46));
+        assert_eq!(batch.combined[12].uv, geometry(1, false)[0].uv);
+    }
+
+    /// Video quads are excluded from OIT tagging and shared-atlas shader-pack passes.
+    #[test]
+    fn a_video_quad_is_never_tagged_for_oit_or_given_to_a_shader_pack() {
+        let mut vertices = [geometry(1, false)[0]; 1];
+        vertices[0].layer = video_layer(1);
+        mark_oit(&mut vertices);
+        assert_eq!(vertices[0].layer, 46 | 1 << 16);
+        assert!(is_native_terrain(video_layer(1)));
+        assert!(!is_native_terrain(46 << 16));
+    }
+
+    /// A frame without video quads resets video_quads to zero.
+    #[test]
+    fn a_frame_without_videos_counts_none() {
+        let quad = |layer, x| {
+            [Vertex {
+                layer,
+                pos: [x, 0.0, 0.0],
+                ..geometry(1, false)[0]
+            }; 4]
+        };
+        let mut batch = EntityBatch::default();
+        batch.update(&quad(video_layer(0), 1.0), &[], &[], &[], false);
+        assert_eq!(batch.video_quads, [1, 0]);
+        batch.update(&quad(0, 1.0), &[], &[], &[], false);
+        assert_eq!(batch.video_quads, [0, 0]);
     }
 }
