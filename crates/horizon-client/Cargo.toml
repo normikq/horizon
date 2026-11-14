@@ -169,7 +169,7 @@ path = "examples/wind_burst_hook_probe.rs"
 # A video screen in the world, played by libmpv (docs/native-libraries.md).
 [[example]]
 name = "video_screen"
-path = "examples/video_screen.rs"
+path = "examples/video_screen/main.rs"
 
 [build-dependencies]
 horizon-mod-api-gen = { path = "../horizon-mod-api-gen" }
