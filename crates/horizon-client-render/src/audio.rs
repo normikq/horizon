@@ -275,6 +275,59 @@ impl Mixer {
         }
         true
     }
+    /// Queues one block for each of several sources of `mod_id` at once, all or none: the
+    /// channels of one multichannel sound (`voices`: source, samples, where) start in the
+    /// same output buffer and stay lined up, and a refusal (the limits of
+    /// [`push_mod_audio`](Self::push_mod_audio)) loses no channel alone.
+    fn push_mod_audio_group(
+        &mut self,
+        mod_id: &str,
+        voices: &[(u128, &[f32], Option<[f64; 3]>)],
+        rate: u32,
+    ) -> bool {
+        if voices.is_empty() || rate == 0 || voices.iter().any(|(_, s, _)| s.is_empty()) {
+            return false;
+        }
+        let seconds = |len: usize| len as f64 / f64::from(rate);
+        let mut new = 0;
+        for (i, (source, samples, _)) in voices.iter().enumerate() {
+            if voices[..i].iter().any(|(s, _, _)| s == source) {
+                return false;
+            }
+            let added = seconds(samples.len());
+            match self
+                .mod_audio
+                .iter()
+                .find(|s| s.source == *source && s.mod_id == mod_id)
+            {
+                Some(s) => {
+                    let waiting: f64 = s
+                        .chunks
+                        .iter()
+                        .map(|c| c.samples.len() as f64 / f64::from(c.rate))
+                        .sum();
+                    if waiting + added > MOD_AUDIO_SECONDS {
+                        return false;
+                    }
+                }
+                None if added > MOD_AUDIO_SECONDS => return false,
+                None => new += 1,
+            }
+        }
+        if self.mod_audio.len() + new > MOD_AUDIO_SOURCES {
+            return false;
+        }
+        for &(source, samples, at) in voices {
+            let queued = self.push_mod_audio(mod_id, source, samples, rate, at);
+            debug_assert!(queued, "checked above");
+        }
+        true
+    }
+    /// Drops what `sources` of `mod_id` have waiting (a video that jumped elsewhere).
+    fn clear_mod_audio(&mut self, mod_id: &str, sources: &[u128]) {
+        self.mod_audio
+            .retain(|s| s.mod_id != mod_id || !sources.contains(&s.source));
+    }
     /// The id of world `name` (1 and up), given once per name.
     fn world_id(&mut self, name: &str) -> u32 {
         let i = match self.world_names.iter().position(|w| w == name) {
@@ -330,6 +383,26 @@ impl MixerBackend {
                 .mixer
                 .lock()
                 .is_ok_and(|mut m| m.push_mod_audio(mod_id, source, samples, rate, at))
+    }
+    /// Queues several sources' blocks together (`Host::push_voices`), all or none:
+    /// [`Mixer::push_mod_audio_group`] under one lock of the mixer.
+    pub fn push_voices(
+        &self,
+        mod_id: &str,
+        voices: &[(u128, &[f32], Option<[f64; 3]>)],
+        rate: u32,
+    ) -> bool {
+        self.live
+            && self
+                .mixer
+                .lock()
+                .is_ok_and(|mut m| m.push_mod_audio_group(mod_id, voices, rate))
+    }
+    /// Drops what `sources` of `mod_id` have waiting (`Host::clear_voices`).
+    pub fn clear_voices(&self, mod_id: &str, sources: &[u128]) {
+        if let Ok(mut m) = self.mixer.lock() {
+            m.clear_mod_audio(mod_id, sources);
+        }
     }
 }
 /// The mixer side of the engine (`Backend`).
@@ -466,6 +539,20 @@ impl Audio {
         at: Option<[f64; 3]>,
     ) -> bool {
         self.backend.push_voice(mod_id, source, samples, rate, at)
+    }
+    /// Plays one block of each of several sources of a mod together, all or none
+    /// (`Host::push_voices`): the channels of one multichannel sound stay lined up.
+    pub fn push_voices(
+        &self,
+        mod_id: &str,
+        voices: &[(u128, &[f32], Option<[f64; 3]>)],
+        rate: u32,
+    ) -> bool {
+        self.backend.push_voices(mod_id, voices, rate)
+    }
+    /// Drops what `sources` of `mod_id` have waiting (`Host::clear_voices`).
+    pub fn clear_voices(&self, mod_id: &str, sources: &[u128]) {
+        self.backend.clear_voices(mod_id, sources);
     }
 }
 
@@ -2988,6 +3075,58 @@ mod tests {
         assert!(!m.push_mod_audio("a", 1, &[0.1; 1], 48_000, None));
         assert!(!m.push_mod_audio("a", 2, &[], 48_000, None));
         assert!(!m.push_mod_audio("a", 2, &[0.1], 0, None));
+    }
+
+    #[test]
+    fn mod_audio_channels_queued_together_start_together_or_not_at_all() {
+        let mut m = Mixer::default();
+        // Two blocks of a two-channel sound, each channel's samples marking its block.
+        for (l, r) in [(0.1f32, 0.2f32), (0.3, 0.4)] {
+            let (left, right) = ([l; 4], [r; 4]);
+            let voices = [(1, &left[..], None), (2, &right[..], None)];
+            assert!(m.push_mod_audio_group("video", &voices, 48_000));
+        }
+        let mut data = vec![0.0f32; 8 * 2];
+        mix(&mut m, &mut data, 2, 48_000);
+        let heard: Vec<f32> = data.chunks(2).map(|f| f[0]).collect();
+        // Every frame mixes the two channels of the same block.
+        let expected = [0.3, 0.3, 0.3, 0.3, 0.7, 0.7, 0.7, 0.7];
+        assert!(
+            heard
+                .iter()
+                .zip(expected)
+                .all(|(a, b)| (a - b).abs() < 1e-6),
+            "{heard:?}"
+        );
+        let (left, right) = ([0.25f32; 4], [0.5f32; 4]);
+        // One channel over its two seconds refuses the whole group.
+        assert!(m.push_mod_audio("video", 1, &[0.1; 96_000], 48_000, None));
+        let voices = [(1, &left[..], None), (2, &right[..], None)];
+        assert!(!m.push_mod_audio_group("video", &voices, 48_000));
+        assert!(
+            !m.mod_audio.iter().any(|s| s.source == 2),
+            "the other channel was not queued alone"
+        );
+        // An empty channel or the same source twice is refused.
+        assert!(!m.push_mod_audio_group("video", &[(3, &[][..], None)], 48_000));
+        let twice = [(3, &left[..], None), (3, &left[..], None)];
+        assert!(!m.push_mod_audio_group("video", &twice, 48_000));
+    }
+
+    #[test]
+    fn clearing_mod_audio_drops_only_those_sources_of_that_mod() {
+        let mut m = Mixer::default();
+        for (mod_id, source) in [("video", 1), ("video", 2), ("video", 3), ("other", 1)] {
+            assert!(m.push_mod_audio(mod_id, source, &[0.1; 8], 48_000, None));
+        }
+        m.clear_mod_audio("video", &[1, 2]);
+        let mut left: Vec<(String, u128)> = m
+            .mod_audio
+            .iter()
+            .map(|s| (s.mod_id.clone(), s.source))
+            .collect();
+        left.sort();
+        assert_eq!(left, [("other".into(), 1), ("video".into(), 3)]);
     }
 
     #[test]

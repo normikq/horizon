@@ -41,9 +41,6 @@ horizon-shaders = { path = "../horizon-shaders" }
 horizon-shader-api = { path = "../horizon-shader-api" }
 # Play with Friends: invite codes and their tunnel; the `friends` feature.
 horizon-friends = { path = "../horizon-friends", optional = true }
-# libmpv for the video native mods play in the world, opened at run time from the version
-# folder and only when a mod asks (docs/native-libraries.md).
-horizon-mpv = { path = "../horizon-mpv" }
 # The narrator (GameNarrator): text-to-speech of chat, system messages and screens.
 horizon-narrator = { path = "../horizon-narrator" }
 # Horizon mods: sandboxed WebAssembly components, off unless installed and turned on (docs/mods.md).
@@ -181,6 +178,9 @@ winresource = "0.1"
 workspace = true
 
 [dev-dependencies]
+# The `video_screen` example registers libmpv as its video backend, as horizon-official does
+# for the game (native mods' videos, docs/native-libraries.md).
+horizon-mpv = { path = "../horizon-mpv" }
 horizon-client-render = { path = "../horizon-client-render", features = ["test-support"] }
 horizon-items = { path = "../horizon-items", features = ["test-support"] }
 # Every WGSL shader translated as wgpu's DirectX 12 backend does (gfx.rs tests).

@@ -1791,6 +1791,7 @@ dependencies = [
 name = "horizon-mpv"
 version = "0.1.0"
 dependencies = [
+ "horizon-hooks",
  "libloading",
  "log",
  "serde",
@@ -1818,6 +1819,7 @@ dependencies = [
  "horizon-friends",
  "horizon-game",
  "horizon-heartbeat",
+ "horizon-mpv",
  "horizon-official-servers",
  "horizon-platform",
  "log",

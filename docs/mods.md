@@ -618,7 +618,8 @@ A native mod can also bring a third-party library that the game loads at run tim
 SHA-256 in `native-libraries.toml`; the launcher checks the hash, installs the file beside the built game, and
 never downloads it. The first such library is libmpv, for video on a surface in the world: `native_video_open`
 plays a local file, `native_draw_video` draws its frames on a quad, and `native_video_pause`, `native_video_seek`,
-`native_video_volume` and `native_video_close` drive it. mpv plays the sound itself, outside the game's mixer.
+`native_video_volume` and `native_video_close` drive it. Its sound is captured in step with the picture
+(`native_video_audio*`) for the mod to play through the game's mixer (`native_push_voices`).
 The format, the checks, the helpers and what a frame costs: [native-libraries.md](native-libraries.md).
 
 ## Publish your mod

@@ -94,18 +94,35 @@ struct Wake {
     stop: bool,
 }
 
+/// A rendered frame: `width * height` opaque RGBA pixels, top row first.
+/// The size travels with the pixels: a new file can change it between two frames.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// How many spare frame buffers the player keeps.
+const RECYCLED: usize = 4;
+
 /// What the player's thread and the game share.
 struct Shared {
     wake: Mutex<Wake>,
     woken: Condvar,
     /// The newest frame not taken yet.
-    frame: Mutex<Option<Vec<u8>>>,
-    /// Recycled frame buffers to avoid reallocating 3.7MB every frame.
+    frame: Mutex<Option<Frame>>,
+    /// Spare frame buffers ([`Player::recycle_frame`]), so a frame is not a new allocation.
     recycle: Mutex<Vec<Vec<u8>>>,
+    /// The file starts again at its end (`loop-file`).
+    looped: AtomicBool,
     frames: AtomicU64,
     render_micros: AtomicU64,
     /// f64 bits, [`NONE`] when mpv has none.
     position: AtomicU64,
+    /// When `position` was last set, in microseconds since `epoch`.
+    position_at: AtomicU64,
+    epoch: Instant,
     duration: AtomicU64,
     /// `width << 32 | height` of the video as displayed, [`NONE`] before it is known.
     video_size: AtomicU64,
@@ -127,6 +144,13 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Shared {
+    /// Sets `position` (f64 bits or [`NONE`]) and when it was set.
+    fn set_position(&self, bits: u64) {
+        let micros = self.epoch.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+        self.position_at.store(micros, Ordering::Relaxed);
+        self.position.store(bits, Ordering::Relaxed);
+    }
+
     fn wake(&self, stop: bool) {
         let mut wake = lock(&self.wake);
         wake.pending = true;
@@ -222,13 +246,25 @@ impl Player {
                 (c"input-default-bindings", "no".into()),
                 (c"input-vo-keyboard", "no".into()),
                 (c"load-unsafe-playlists", "no".into()),
-                // Hardware decode with copy-back to system memory when available (e.g. d3d11va-copy / nvdec-copy).
-                (c"hwdec", "auto-safe".into()),
                 (c"idle", "yes".into()),
                 // The last frame stays up at the end (`ended`).
                 (c"keep-open", "yes".into()),
-                (c"loop-file", if options.looped { "inf".into() } else { "no".into() }),
-                (c"audio", if options.muted { "no".into() } else { "auto".into() }),
+                (
+                    c"loop-file",
+                    if options.looped {
+                        "inf".into()
+                    } else {
+                        "no".into()
+                    },
+                ),
+                (
+                    c"audio",
+                    if options.muted {
+                        "no".into()
+                    } else {
+                        "auto".into()
+                    },
+                ),
                 (c"volume", volume),
             ];
             if let Some(pipe) = &audio_pipe {
@@ -237,12 +273,25 @@ impl Player {
                 settings.push((c"ao-pcm-waveheader", "no".into()));
                 settings.push((c"audio-format", "float".into()));
                 settings.push((c"audio-channels", "7.1".into()));
-                settings.push((c"audio-samplerate", "48000".into()));
+                settings.push((
+                    c"audio-samplerate",
+                    crate::audio_pipe::SAMPLE_RATE.to_string(),
+                ));
             }
             for (name, value) in settings {
                 let value = CString::new(value).unwrap_or_default();
                 let code = (api.mpv_set_option_string)(handle, name.as_ptr(), value.as_ptr());
                 api.check("mpv_set_option_string", code).map_err(fail)?;
+            }
+            // Hardware decoding only with copy-back: the software render API
+            // reads frames from system memory. A libmpv too old to know
+            // `auto-copy-safe` decodes in software rather than failing.
+            let hwdec_set = |value: &CStr| {
+                (api.mpv_set_option_string)(handle, c"hwdec".as_ptr(), value.as_ptr()) >= 0
+            };
+            if !hwdec_set(c"auto-copy-safe") {
+                log::info!("libmpv has no auto-copy-safe hardware decoding: decoding in software");
+                hwdec_set(c"no");
             }
             api.check("mpv_initialize", (api.mpv_initialize)(handle))
                 .map_err(fail)?;
@@ -252,9 +301,12 @@ impl Player {
                 woken: Condvar::new(),
                 frame: Mutex::new(None),
                 recycle: Mutex::new(Vec::new()),
+                looped: AtomicBool::new(options.looped),
                 frames: AtomicU64::new(0),
                 render_micros: AtomicU64::new(0),
                 position: AtomicU64::new(NONE),
+                position_at: AtomicU64::new(0),
+                epoch: Instant::now(),
                 duration: AtomicU64::new(NONE),
                 video_size: AtomicU64::new(NONE),
                 render_size: AtomicU64::new(0),
@@ -348,15 +400,26 @@ impl Player {
     /// Plays the local file `path` from its start, in place of the current one.
     pub fn load(&self, path: &Path) -> Result<(), Error> {
         let file = local_file(path)?;
+        let file = CString::new(file).map_err(|_| Error::NotLocal(path.to_owned()))?;
         self.shared.loaded.store(false, Ordering::Relaxed);
         self.shared.ended.store(false, Ordering::Relaxed);
         self.shared.failed.store(false, Ordering::Relaxed);
-        let file = CString::new(file).map_err(|_| Error::NotLocal(path.to_owned()))?;
+        // The old file's time is not the new one's: no sync until mpv tells.
+        self.shared.set_position(NONE);
+        // The old file's sound must not play over the new one, whose audio starts at 0.
+        self.reset_audio(0.0, true);
         let mut args = [c"loadfile".as_ptr(), file.as_ptr(), std::ptr::null()];
         // SAFETY: a NULL-terminated array of C strings. `loadfile` only puts the
         // file on mpv's playlist: opening it happens on mpv's threads.
         let code = unsafe { (self.api.mpv_command)(self.handle, args.as_mut_ptr()) };
         self.api.check("mpv_command", code)
+    }
+
+    /// Empties the captured sound; what mpv writes next is at `seconds`.
+    fn reset_audio(&self, seconds: f64, new_file: bool) {
+        if let Some(pipe) = &self.audio_pipe {
+            lock(&pipe.buffer).reset(seconds, new_file);
+        }
     }
 
     pub fn set_paused(&self, paused: bool) -> Result<(), Error> {
@@ -368,11 +431,10 @@ impl Player {
         if !seconds.is_finite() || seconds < 0.0 {
             return Err(Error::Mpv("seek", format!("{seconds} is not a time")));
         }
-        if let Some(pipe) = &self.audio_pipe {
-            if let Ok(mut lock) = pipe.buffer.lock() {
-                lock.clear();
-            }
-        }
+        // The sound after the jump starts at `seconds`, and so does the picture:
+        // until mpv reports the new time, the old one would look far behind.
+        self.reset_audio(seconds, false);
+        self.shared.set_position(seconds.to_bits());
         self.command(&["seek", &format!("{seconds:.3}"), "absolute"])
     }
 
@@ -382,7 +444,9 @@ impl Player {
     }
 
     pub fn set_looped(&self, looped: bool) -> Result<(), Error> {
-        self.command(&["set", "loop-file", if looped { "inf" } else { "no" }])
+        self.command(&["set", "loop-file", if looped { "inf" } else { "no" }])?;
+        self.shared.looped.store(looped, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Stops the playback and forgets the file.
@@ -400,6 +464,20 @@ impl Player {
     /// Seconds from the file's start, once it plays.
     pub fn position(&self) -> Option<f64> {
         Self::seconds(&self.shared.position)
+    }
+
+    /// The picture's time now: [`position`](Self::position) carried on by
+    /// the time since mpv last reported it while playing (it reports a file
+    /// without video only about once a second), by at most a second.
+    fn clock(&self) -> Option<f64> {
+        let position = self.position()?;
+        if self.paused() || self.ended() {
+            return Some(position);
+        }
+        let at = self.shared.position_at.load(Ordering::Relaxed);
+        let now = self.shared.epoch.elapsed().as_micros() as u64;
+        let since = now.saturating_sub(at) as f64 / 1e6;
+        Some(position + since.min(1.0))
     }
 
     /// The file's length in seconds, when mpv knows it.
@@ -435,21 +513,15 @@ impl Player {
         }
     }
 
-    /// The newest frame since the last call: `width * height` RGBA pixels,
-    /// top row first, opaque. None when mpv showed nothing new.
-    pub fn take_frame(&self) -> Option<Vec<u8>> {
+    /// The newest frame since the last call, with its own size. None when
+    /// mpv showed nothing new.
+    pub fn take_frame(&self) -> Option<Frame> {
         lock(&self.shared.frame).take()
     }
 
-    /// Recycles a previously taken frame buffer to be reused for future frames.
-    pub fn recycle_frame(&self, mut buf: Vec<u8>) {
-        if buf.capacity() >= (self.width * self.height * 4) as usize {
-            let mut rec = lock(&self.shared.recycle);
-            if rec.len() < 4 {
-                buf.clear();
-                rec.push(buf);
-            }
-        }
+    /// Gives a taken frame's buffer back to be rendered into again.
+    pub fn recycle_frame(&self, buf: Vec<u8>) {
+        recycle(&self.shared, buf);
     }
 
     /// The average RGB color ([r, g, b] in 0..=255) of the newest frame rendered so far,
@@ -459,7 +531,11 @@ impl Player {
             return None;
         }
         let rgb = self.shared.color.load(Ordering::Relaxed);
-        Some([((rgb >> 16) & 0xff) as u8, ((rgb >> 8) & 0xff) as u8, (rgb & 0xff) as u8])
+        Some([
+            ((rgb >> 16) & 0xff) as u8,
+            ((rgb >> 8) & 0xff) as u8,
+            (rgb & 0xff) as u8,
+        ])
     }
 
     /// Left, center and right zone average RGB colors of the newest frame rendered so far,
@@ -468,7 +544,13 @@ impl Player {
         if self.shared.frames.load(Ordering::Relaxed) == 0 {
             return None;
         }
-        let unpack = |val: u32| [((val >> 16) & 0xff) as u8, ((val >> 8) & 0xff) as u8, (val & 0xff) as u8];
+        let unpack = |val: u32| {
+            [
+                ((val >> 16) & 0xff) as u8,
+                ((val >> 8) & 0xff) as u8,
+                (val & 0xff) as u8,
+            ]
+        };
         Some([
             unpack(self.shared.color_left.load(Ordering::Relaxed)),
             unpack(self.shared.color_center.load(Ordering::Relaxed)),
@@ -476,65 +558,55 @@ impl Player {
         ])
     }
 
-    /// Takes up to `max_samples` mono audio samples (downmixed from stereo, -1.0..=1.0)
-    /// captured from mpv's audio stream, resynced against video playback position.
+    /// The rate of every sample the `take_audio*` calls give, in hertz;
+    /// none when the sound is not captured.
+    pub fn audio_sample_rate(&self) -> Option<u32> {
+        self.audio_pipe
+            .as_ref()
+            .map(|_| crate::audio_pipe::SAMPLE_RATE)
+    }
+
+    /// Runs `take` on the captured sound once it is lined up with the
+    /// picture: lagging sound is dropped, sound ahead of it is held (none
+    /// then). `take` gives nothing when it got nothing.
+    fn take_synced<T>(
+        &self,
+        take: impl FnOnce(&mut crate::audio_pipe::AudioBuffer) -> Option<T>,
+    ) -> Option<T> {
+        let pipe = self.audio_pipe.as_ref()?;
+        let mut buffer = lock(&pipe.buffer);
+        if let Some(position) = self.clock() {
+            let looped = self.shared.looped.load(Ordering::Relaxed);
+            let loop_length = looped.then(|| self.duration()).flatten();
+            if !buffer.sync(position, loop_length) {
+                return None;
+            }
+        }
+        take(&mut buffer)
+    }
+
+    /// Takes up to `max_samples` mono samples (-1.0..=1.0) of the video's
+    /// sound, a surround file folded down first, in step with the picture.
     pub fn take_audio(&self, max_samples: usize) -> Option<Vec<f32>> {
-        let pipe = self.audio_pipe.as_ref()?;
-        let mut lock = pipe.buffer.lock().ok()?;
-        if let Some(pos) = self.position() {
-            lock.resync(pos, 48000);
-        }
-        let samples = lock.take_mono(max_samples);
-        if samples.is_empty() {
-            None
-        } else {
-            Some(samples)
-        }
+        self.take_synced(|b| Some(b.take_mono(max_samples)).filter(|s| !s.is_empty()))
     }
 
-    /// Takes up to `max_samples` stereo (left, right) audio samples.
+    /// Takes up to `max_samples` stereo (left, right) samples: a surround
+    /// file folded down with its centre and surrounds.
     pub fn take_audio_stereo(&self, max_samples: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-        let pipe = self.audio_pipe.as_ref()?;
-        let mut lock = pipe.buffer.lock().ok()?;
-        if let Some(pos) = self.position() {
-            lock.resync(pos, 48000);
-        }
-        let (left, right) = lock.take_stereo(max_samples);
-        if left.is_empty() && right.is_empty() {
-            None
-        } else {
-            Some((left, right))
-        }
+        self.take_synced(|b| Some(b.take_stereo(max_samples)).filter(|(l, _)| !l.is_empty()))
     }
 
-    /// Takes up to `max_samples` 5.1 surround channels [FL, FR, FC, LFE, SL, SR].
+    /// Takes up to `max_samples` 5.1 frames [FL, FR, FC, LFE, SL, SR]: a
+    /// stereo file upmixed.
     pub fn take_audio_51(&self, max_samples: usize) -> Option<[Vec<f32>; 6]> {
-        let pipe = self.audio_pipe.as_ref()?;
-        let mut lock = pipe.buffer.lock().ok()?;
-        if let Some(pos) = self.position() {
-            lock.resync(pos, 48000);
-        }
-        let channels = lock.take_51(max_samples);
-        if channels[0].is_empty() {
-            None
-        } else {
-            Some(channels)
-        }
+        self.take_synced(|b| Some(b.take_51(max_samples)).filter(|c| !c[0].is_empty()))
     }
 
-    /// Takes up to `max_samples` 7.1 surround channels [FL, FR, FC, LFE, BL, BR, SL, SR].
+    /// Takes up to `max_samples` 7.1 frames [FL, FR, FC, LFE, BL, BR, SL, SR]:
+    /// a stereo file upmixed.
     pub fn take_audio_71(&self, max_samples: usize) -> Option<[Vec<f32>; 8]> {
-        let pipe = self.audio_pipe.as_ref()?;
-        let mut lock = pipe.buffer.lock().ok()?;
-        if let Some(pos) = self.position() {
-            lock.resync(pos, 48000);
-        }
-        let channels = lock.take_71(max_samples);
-        if channels[0].is_empty() {
-            None
-        } else {
-            Some(channels)
-        }
+        self.take_synced(|b| Some(b.take_71(max_samples)).filter(|c| !c[0].is_empty()))
     }
 
     pub fn stats(&self) -> Stats {
@@ -558,6 +630,14 @@ impl Drop for Player {
         // Not joined: destroying the core can take a while, and the game's
         // thread must not wait for it.
         self.shared.wake(true);
+    }
+}
+
+/// Keeps `buf` for a later frame, unless enough are kept already.
+fn recycle(shared: &Shared, buf: Vec<u8>) {
+    let mut kept = lock(&shared.recycle);
+    if kept.len() < RECYCLED {
+        kept.push(buf);
     }
 }
 
@@ -600,12 +680,20 @@ fn run(core: Core, shared: &Shared, width: u32, height: u32) {
                 }
                 _ => (width, height),
             };
-            shared.render_size.store(u64::from(target_w) << 32 | u64::from(target_h), Ordering::Relaxed);
-            let mut buf = lock(&shared.recycle).pop().unwrap_or_default();
+            shared.render_size.store(
+                u64::from(target_w) << 32 | u64::from(target_h),
+                Ordering::Relaxed,
+            );
             let needed = (target_w * target_h * 4) as usize;
-            if buf.len() != needed {
-                buf.resize(needed, 0);
-            }
+            let mut buf = match lock(&shared.recycle).pop() {
+                Some(mut buf) => {
+                    buf.resize(needed, 0);
+                    buf
+                }
+                // Zeroed by the allocator (fresh pages from the system for a
+                // frame this large), not filled byte by byte here.
+                None => vec![0; needed],
+            };
             if render_frame(&api, render, target_w, target_h, &mut buf) {
                 shared.render_micros.store(
                     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
@@ -617,18 +705,17 @@ fn run(core: Core, shared: &Shared, width: u32, height: u32) {
                 shared.color_left.store(left, Ordering::Relaxed);
                 shared.color_center.store(center, Ordering::Relaxed);
                 shared.color_right.store(right, Ordering::Relaxed);
-                let mut frame_lock = lock(&shared.frame);
-                if let Some(old) = frame_lock.replace(buf) {
-                    let mut rec = lock(&shared.recycle);
-                    if rec.len() < 4 {
-                        rec.push(old);
-                    }
+                let frame = Frame {
+                    rgba: buf,
+                    width: target_w,
+                    height: target_h,
+                };
+                let old = lock(&shared.frame).replace(frame);
+                if let Some(old) = old {
+                    recycle(shared, old.rgba);
                 }
             } else {
-                let mut rec = lock(&shared.recycle);
-                if rec.len() < 4 {
-                    rec.push(buf);
-                }
+                recycle(shared, buf);
             }
         }
     }
@@ -763,11 +850,8 @@ fn calculate_frame_colors(pixels: &[u8], width: u32, height: u32) -> (u32, u32, 
     }
 
     let pack = |r: u64, g: u64, b: u64, c: u64| -> u32 {
-        if c == 0 {
-            0
-        } else {
-            (((r / c) as u32) << 16) | (((g / c) as u32) << 8) | ((b / c) as u32)
-        }
+        let avg = |v: u64| v.checked_div(c).unwrap_or(0) as u32;
+        (avg(r) << 16) | (avg(g) << 8) | avg(b)
     };
 
     (
@@ -839,7 +923,7 @@ fn events(
                         .and_then(|v| u32::try_from(v).ok())
                 };
                 match event.reply_userdata {
-                    OBSERVE_POSITION => shared.position.store(double(), Ordering::Relaxed),
+                    OBSERVE_POSITION => shared.set_position(double()),
                     OBSERVE_DURATION => shared.duration.store(double(), Ordering::Relaxed),
                     OBSERVE_PAUSE => shared.paused.store(flag(), Ordering::Relaxed),
                     OBSERVE_ENDED => shared.ended.store(flag(), Ordering::Relaxed),
@@ -953,13 +1037,14 @@ mod tests {
         let width = 64;
         let height = 36;
         let mut pixels = vec![0u8; width * height * 4];
-        for chunk in pixels.chunks_exact_mut(4) {
+        for chunk in pixels.as_chunks_mut::<4>().0 {
             chunk[0] = 255;
             chunk[1] = 128;
             chunk[2] = 0;
             chunk[3] = 255;
         }
-        let (avg, left, center, right) = calculate_frame_colors(&pixels, width as u32, height as u32);
+        let (avg, left, center, right) =
+            calculate_frame_colors(&pixels, width as u32, height as u32);
         assert_eq!(avg, (255 << 16) | (128 << 8));
         assert_eq!(left, (255 << 16) | (128 << 8));
         assert_eq!(center, (255 << 16) | (128 << 8));

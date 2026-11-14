@@ -109,6 +109,8 @@ fn a_file_plays_into_frames_of_the_right_colours() {
         frame.is_some()
     });
     let frame = frame.unwrap();
+    assert_eq!((frame.width, frame.height), (WIDTH, HEIGHT));
+    let frame = frame.rgba;
     assert_eq!(frame.len(), (WIDTH * HEIGHT * 4) as usize);
     let at = |x: u32, y: u32| {
         let i = ((y * WIDTH + x) * 4) as usize;
@@ -141,6 +143,87 @@ fn a_file_plays_into_frames_of_the_right_colours() {
     println!(
         "{} frames, the last rendered in {} us",
         stats.frames, stats.render_micros
+    );
+    player.close();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `seconds` of a 440 Hz tone in both channels, as a 48 kHz 16-bit WAV file.
+fn write_tone(path: &Path, seconds: u32) {
+    let rate = 48_000u32;
+    let frames = rate * seconds;
+    let data = frames * 4;
+    let mut out = Vec::with_capacity(44 + data as usize);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + data).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    out.extend_from_slice(&rate.to_le_bytes());
+    out.extend_from_slice(&(rate * 4).to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&data.to_le_bytes());
+    for i in 0..frames {
+        let t = f64::from(i) / f64::from(rate);
+        let s = ((t * 440.0 * std::f64::consts::TAU).sin() * 16_000.0) as i16;
+        out.extend_from_slice(&s.to_le_bytes());
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, out).unwrap();
+}
+
+/// Audible samples taken over `secs` of playback, taking as a game frame does.
+fn audible_for(player: &horizon_mpv::Player, secs: f64) -> usize {
+    let deadline = Instant::now() + Duration::from_secs_f64(secs);
+    let mut audible = 0;
+    while Instant::now() < deadline {
+        if let Some((left, _)) = player.take_audio_stereo(4096) {
+            audible += left.iter().filter(|s| s.abs() > 0.05).count();
+        }
+        std::thread::sleep(Duration::from_millis(16));
+    }
+    audible
+}
+
+#[test]
+fn captured_sound_survives_seeks_and_a_new_file() {
+    let Some(library) = library() else { return };
+    let dir = scratch("audio");
+    let file = dir.join("tone.wav");
+    write_tone(&file, 8);
+
+    let mpv = Mpv::open(&library).unwrap();
+    let options = Options {
+        capture_audio: true,
+        ..Options::default()
+    };
+    let player = mpv.player(64, 64, &options).unwrap();
+    assert_eq!(player.audio_sample_rate(), Some(horizon_mpv::SAMPLE_RATE));
+    player.load(&file).unwrap();
+    wait("the file", 20, || player.loaded());
+    // A tone at 48 kHz: most of what plays in half a second is audible.
+    let rate = horizon_mpv::SAMPLE_RATE as usize;
+    assert!(
+        audible_for(&player, 1.0) > rate / 4,
+        "no sound from the start"
+    );
+
+    // Away from the start, forward and back: the sound must keep coming.
+    for to in [5.0, 2.0] {
+        player.seek(to).unwrap();
+        let heard = audible_for(&player, 1.0);
+        assert!(heard > rate / 4, "no sound after seeking to {to}: {heard}");
+    }
+
+    // The same file again, from its start.
+    player.load(&file).unwrap();
+    wait("the file again", 20, || player.loaded());
+    assert!(
+        audible_for(&player, 1.0) > rate / 4,
+        "no sound after a new load"
     );
     player.close();
     let _ = std::fs::remove_dir_all(&dir);

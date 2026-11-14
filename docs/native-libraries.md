@@ -33,9 +33,12 @@ So the pieces are:
 
 - **`crates/horizon-mpv`** opens libmpv by its full path at run time, checks its SHA-256, and plays a file through
   mpv's software render API into RGBA frames on a thread of its own. Nothing links against libmpv, and a game
-  that plays no video never loads it.
-- **Video slots** (`crates/horizon-client-render/src/video_slots.rs`): two 1280x720 atlas slots, `horizon/video0`
-  and `horizon/video1`, present only in a game built with native mods, like the mod image slot.
+  that plays no video never loads it. The engine does not depend on it: `horizon-hooks` names the video backend
+  (`horizon_hooks::video`), `horizon-mpv` implements it (`horizon_mpv::hooks::HOOKS`), and horizon-official
+  registers it, as it does Play with Friends' tunnel. A game without it opens no video and says why.
+- **Video slots** (`crates/horizon-client-render/src/video_slots.rs`): two atlas slots of `VIDEO_WIDTH` x
+  `VIDEO_HEIGHT`, `horizon/video0` and `horizon/video1`, present only in a game built with native mods, like the
+  mod image slot.
 - **The helpers** (`crates/horizon-client/src/game/extras/video.rs`) open a surface, drive the playback and draw
   the slot on a quad.
 - **The launcher** (`launcher/src/native_mods/libraries.rs`) reads the declaration, checks the file's hash and
@@ -84,7 +87,7 @@ the file that runs is the file the mod's author named. They do not make that fil
 |---|---|
 | Build, before anything compiles | The manifest's keys and values; the file exists; its SHA-256 is the declared one. A mismatch stops the build with both hashes. |
 | Install | The file is copied to `<version folder>/native-libraries/` and hashed again there. The list goes to `<version folder>/native-libraries.json` and into `native-mods.json`. |
-| First video in the game | The game reads `native-libraries.json` beside its executable, refuses a file name with a folder in it, hashes the file again, and only then loads it. |
+| First video in the game | The game reads `native-libraries.json` beside its executable, refuses a file name with a folder in it, hashes the file again through a handle it keeps open, and only then loads it. On Windows that handle shares reading only, so the file cannot be written, replaced or renamed between the hash and the load (or while it stays loaded); on Unix the game checks after the load that the path still names the file it hashed. |
 | Load | By full path only. On Windows the library's own imports resolve from its folder and System32, never from the game's folder, the working directory or `PATH`. |
 | Each file mpv opens | mpv's `on_load` hook passes local files only. A URL, a network share, a device, or a playlist entry that names one is stopped before mpv opens it. |
 
@@ -100,17 +103,33 @@ All are methods of `Game`, called from a mod's helpers like `native_draw_quad`. 
 
 | Helper | What it does |
 |---|---|
-| `native_video_open(path, width, height, looped) -> Result<u32, String>` | Opens a surface of `width` x `height` pixels (at most 1280 x 720) and plays the local file `path` on it. Returns the surface, or why there is none. |
+| `native_video_open(path, width, height, looped) -> Result<u32, String>` | Opens a surface of `width` x `height` pixels (at most a video slot's size) and plays the local file `path` on it. Returns the video's id, or why there is none. The id is not a slot number: once the video closes (or the world is left) it names nothing, even after another video takes the slot. |
 | `native_video_load(video, path) -> Result<(), String>` | Plays another local file on the surface. |
 | `native_video_pause(video, paused) -> bool` | Pauses or resumes. |
-| `native_video_seek(video, seconds) -> bool` | Jumps to a time from the file's start. |
+| `native_video_seek(video, seconds) -> bool` | Jumps to a time from the file's start. The sound waiting to be taken is dropped; what comes next is from the new time. |
 | `native_video_volume(video, volume) -> bool` | Sets the loudness, 0 to 100. |
 | `native_video_close(video) -> bool` | Stops the video and frees its surface. |
 | `native_video_state(video) -> Option<NativeVideoState>` | Position, duration, paused, ended, loaded, failed, sizes, and what the frames cost. |
 | `native_draw_video(draw, video, corners) -> bool` | From `native_block_entity_submit`: draws the current frame on a quad, corners in `native_draw_quad`'s order. Full bright, whatever the light on the block. False until the first frame is there. |
+| `native_draw_video_part(draw, video, corners, uv) -> bool` | As `native_draw_video`, for the part `uv` (`[u0, v0, u1, v1]`, 0 to 1) of the frame: a curved or multi-panel screen draws one slice per quad. |
+| `native_video_color(video) -> Option<[u8; 3]>` | The current frame's average colour, for light the screen casts. None before the first frame. |
+| `native_video_colors(video) -> Option<[[u8; 3]; 3]>` | The same for the frame's left, centre and right thirds. |
+| `native_video_audio_rate(video) -> Option<u32>` | The rate of the samples below, in hertz (48000 today: ask, do not assume). |
+| `native_video_audio(video, max_samples) -> Option<Vec<f32>>` | Takes up to `max_samples` of the sound as mono, -1 to 1, in step with the picture ([Sound](#sound)). None when nothing is due. |
+| `native_video_audio_stereo(video, max_samples)` | The same as left and right. A surround file is folded down with its centre and surrounds. |
+| `native_video_audio_51(video, max_samples)`, `native_video_audio_71(video, max_samples)` | The same as 5.1 (FL, FR, FC, LFE, SL, SR) or 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR) channels. A stereo file is upmixed. |
+
+Two mixer helpers (`tools/native-hook-fragments/push_voices.json`) play what those give:
+
+| Helper | What it does |
+|---|---|
+| `native_push_voices(mod_id, sources, channels, sample_rate, at) -> bool` | Queues one mono block per source, each at its own place, under one lock and all or none: the channels of one sound start in the same output buffer and are never refused one at a time, so they stay lined up. |
+| `native_clear_voices(mod_id, sources)` | Drops what those sources have waiting in the mixer. Call it after a seek, so the up to two seconds queued from before the jump do not play on. |
 
 Two surfaces play at once. The video keeps its shape: mpv fits it into the surface with black bars, so give the
-quad the surface's proportions. Videos stop when the player leaves the world for the title screen.
+quad the surface's proportions. Videos stop when the player leaves the world for the title screen, and their ids
+stop naming them: a mod that keeps an id sees `native_video_state` give none, and should forget it (or close its
+videos itself in `client_level_unload`).
 
 The first `native_video_open` hashes and loads the library on the game's thread. For a 120 MB libmpv that is a
 pause of a few hundred milliseconds, once per run. Open the first surface when the player asks for a video, not
@@ -143,10 +162,33 @@ if let Some(video) = *screen {
 
 ## Sound
 
-mpv plays the sound itself, through its own audio output, on the system's default device. It does not go
-through the game's mixer: the game's volume sliders, its positional audio and its mute do not apply. A mod sets
-the loudness with `native_video_volume` and can lower it with distance itself. Routing the sound into the game's
-mixer is not part of this work.
+The sound is captured, not played by mpv. mpv decodes it, resampled to 48 kHz and laid out as 7.1, and writes it
+with `ao=pcm` into a named pipe (Windows) or a FIFO (Unix); a thread of the player reads it into a buffer of up to
+five seconds. A mod takes it with `native_video_audio*` each frame, about a frame's worth or more, and plays it
+through the game's mixer with `native_push_voices`, a source per channel placed where its speaker stands. The
+game's volume sliders, its positional audio and its mute then apply; `native_video_volume` sets mpv's own
+loudness before that.
+
+- **In step with the picture.** The buffer knows the media time of its oldest sample: the time of the last
+  `seek` (0 after `load`), plus every sample taken, dropped to catch up or dropped for room since. Before each
+  take it is compared with the picture's time (mpv's `time-pos`, carried on between its reports): sound more than
+  0.15 s behind is dropped, sound more than 0.3 s ahead is held (the take gives none), and a looped file's wrap is
+  followed. Sound more than 2 s ahead is taken to be counted wrong (a file whose sound starts late or has gaps)
+  and the clock is set from the picture.
+- **Held to real time.** `ao=pcm` has no clock: on its own mpv writes a file's sound as fast as the pipe takes it,
+  a whole file in a fraction of a second, and its playback clock follows. The reader takes no more than real time
+  plus 2 s, so mpv's writes block and its playback keeps the pace. mpv's own refill after a seek or a new file
+  (about 1.4 s) starts a new run.
+- **Channels.** The buffer keeps what mpv wrote. A file with sound outside FL and FR is surround from then until
+  the next file, so a quiet stretch of a film is not upmixed; a stereo file is upmixed for 5.1 and 7.1 (dialogue
+  to the centre at -3 dB, the difference to the surrounds, the low end of the sum to the subwoofer below 120 Hz).
+  Mono and stereo fold a surround file down as ITU-R BS.775 does, centre and surrounds at -3 dB, not normalized,
+  like mpv's own downmix: the dialogue stays.
+- **Reconnects.** mpv may open its output again (a seek, a new file or track) before it closes the old one. Each
+  connection to the pipe gets a reader of its own, so the new one is never refused or left waiting.
+
+Without `capture_audio` (`horizon_mpv::Options`) mpv plays the sound through its own audio output instead; the
+game never asks for that.
 
 ## Frame cost
 
@@ -189,7 +231,8 @@ With a libmpv for your platform (client API 2, such as `libmpv-2.dll`):
 # The version the library reports, opened the way the game opens it.
 cargo run -p horizon-mpv --example mpv_version -- --file /full/path/to/libmpv-2.dll
 
-# Plays a generated file: colours, pause, seek, a broken file, a playlist that names an address.
+# Plays generated files: colours, pause, seek, a broken file, a playlist that names an address,
+# and captured sound that keeps coming after seeks and a new file.
 HORIZON_MPV_LIBRARY=/full/path/to/libmpv-2.dll cargo test -p horizon-mpv
 
 # What a 720p frame costs on this computer.
@@ -225,14 +268,17 @@ target/fast/examples/video_screen --resources PATH --game-dir SCRATCH --world Vi
   it. A fork that ships a libmpv in its installer takes on that build's licence terms for the bundle and needs
   that reviewed first. `horizon-mpv` is written against mpv's documented client API, whose headers are ISC, and
   contains no mpv code.
-- **Platforms.** Built and tested on Windows x64. The loader has a Unix path, untested.
+- **Platforms.** Built and tested on Windows x64. The loader and the sound's FIFO have a Unix path, untested.
 - **Renderer.** Frames come from mpv's software renderer and reach the GPU as a texture patch. A zero-copy path
   through mpv's OpenGL or D3D11 renderer would need the engine to share a device with mpv, which wgpu does not
   offer today.
-- **Hardware decoding** is off: the software renderer needs frames in system memory.
+- **Hardware decoding** uses copy-back only (`hwdec=auto-copy-safe`): the software renderer needs frames in
+  system memory, and copy-back hands them there. A libmpv that does not know that value decodes in software.
 - **Where videos come from.** Local files only. Streams would need a list of allowed protocols, a setting and a
   consent screen, and are refused until someone designs those.
-- **Sound in the game's mixer.** Not done, see [Sound](#sound).
+- **Sound timing.** The picture's time comes from mpv's `time-pos`, the sound's from counting samples; `ao=pcm`
+  gives no time stamps of its own. Good to a frame or two with the files tried; a file with large gaps in its
+  sound is resynced from the picture rather than followed exactly.
 - **The launcher builds from GitHub.** A native build compiles the source of a Horizon revision downloaded from
   the repository, never a checkout on this computer. These helpers exist only in a fork's own tree, so the fork
   must publish its source and point its launcher at it before players can build a video mod.

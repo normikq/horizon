@@ -7,6 +7,8 @@ rust-version.workspace = true
 description = "libmpv opened at run time from the game's version folder: checked by SHA-256, played through the software render API into RGBA frames (docs/native-libraries.md)"
 
 [dependencies]
+# The game's video backend hook it implements (`hooks::HOOKS`, registered by horizon-official).
+horizon-hooks = { path = "../horizon-hooks" }
 # libmpv is opened by its full path at run time; nothing links against it.
 libloading = "0.8.9"
 log = "0.4"

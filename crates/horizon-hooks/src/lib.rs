@@ -24,6 +24,7 @@ pub mod players;
 mod registry;
 pub mod settings;
 pub mod tunnel;
+pub mod video;
 
 use registry::Registry;
 use std::cell::Cell;
@@ -86,6 +87,12 @@ pub trait Hooks: Sync {
     /// offers one is used. Asked on the network thread when joining and on the game thread when
     /// an address is shown, never per frame.
     fn tunnel(&self) -> Option<&dyn tunnel::Resolver> {
+        None
+    }
+
+    /// The video library backend this crate offers ([`video`]), for native mods' videos in the
+    /// world; the first hook that offers one is used. Asked when a mod opens its first video.
+    fn video(&self) -> Option<&dyn video::Backend> {
         None
     }
 
@@ -334,6 +341,11 @@ pub mod engine {
     /// [`Hooks::tunnel`]: the first registered hook's resolver.
     pub fn tunnel() -> Option<&'static dyn tunnel::Resolver> {
         all().iter().find_map(|hooks| hooks.tunnel())
+    }
+
+    /// [`Hooks::video`]: the first registered hook's backend.
+    pub fn video() -> Option<&'static dyn video::Backend> {
+        all().iter().find_map(|hooks| hooks.video())
     }
 }
 

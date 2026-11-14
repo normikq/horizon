@@ -88,8 +88,13 @@ pub fn installed(version_dir: &Path) -> Result<Vec<Installed>, Error> {
 
 /// The SHA-256 of the file at `path`, lowercase hex.
 pub fn sha256_of(path: &Path) -> Result<String, Error> {
+    let mut file = std::fs::File::open(path).map_err(|e| Error::Io(path.to_owned(), e))?;
+    sha256_of_file(&mut file, path)
+}
+
+/// The SHA-256 of what is left to read of `file` (at `path`, for errors).
+fn sha256_of_file(file: &mut std::fs::File, path: &Path) -> Result<String, Error> {
     let io = |e| Error::Io(path.to_owned(), e);
-    let mut file = std::fs::File::open(path).map_err(io)?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; 1 << 20];
     loop {
@@ -103,8 +108,62 @@ pub fn sha256_of(path: &Path) -> Result<String, Error> {
 }
 
 /// The full path of library `name` in `version_dir`, once its file is there,
-/// is a plain file and has the declared SHA-256.
+/// is a plain file and has the declared SHA-256. Loading by this path later
+/// leaves a moment in which the file could be swapped: [`verified_open`]
+/// closes it.
 pub fn verified(version_dir: &Path, name: &str) -> Result<PathBuf, Error> {
+    verified_open(version_dir, name).map(|v| v.path)
+}
+
+/// A library whose hash was checked through the open file that is kept here.
+/// On Windows the file stays open without write or delete sharing, so it
+/// cannot be changed, replaced or renamed while this lives; on Unix
+/// [`still_same`](Self::still_same) tells whether the path still names it.
+#[derive(Debug)]
+pub struct Verified {
+    /// Absolute.
+    pub path: PathBuf,
+    file: std::fs::File,
+}
+
+impl Verified {
+    /// Whether `path` still names the file that was hashed (no swap since).
+    pub fn still_same(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let (Ok(now), Ok(then)) = (std::fs::metadata(&self.path), self.file.metadata()) else {
+                return false;
+            };
+            now.dev() == then.dev() && now.ino() == then.ino()
+        }
+        #[cfg(not(unix))]
+        {
+            // The open file denies writing, deleting and renaming.
+            let _ = &self.file;
+            true
+        }
+    }
+}
+
+/// Opens `path` for hashing, as [`Verified`] keeps it.
+fn open_locked(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        /// `FILE_SHARE_READ`: others may read (and load) it, never write,
+        /// delete or rename it.
+        const FILE_SHARE_READ: u32 = 0x1;
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options.open(path)
+}
+
+/// Library `name` in `version_dir`, checked as [`verified`] does, through a
+/// file kept open so that what is loaded is what was hashed.
+pub fn verified_open(version_dir: &Path, name: &str) -> Result<Verified, Error> {
     let library = installed(version_dir)?
         .into_iter()
         .find(|l| l.name == name)
@@ -122,7 +181,8 @@ pub fn verified(version_dir: &Path, name: &str) -> Result<PathBuf, Error> {
             path.display()
         )));
     }
-    let actual = sha256_of(&path)?;
+    let mut file = open_locked(&path).map_err(|e| Error::Io(path.clone(), e))?;
+    let actual = sha256_of_file(&mut file, &path)?;
     if actual != library.sha256 {
         return Err(Error::Hash {
             file: path,
@@ -131,7 +191,8 @@ pub fn verified(version_dir: &Path, name: &str) -> Result<PathBuf, Error> {
         });
     }
     // Absolute even when the version folder was given relative to the working directory.
-    std::path::absolute(&path).map_err(|e| Error::Io(path, e))
+    let path = std::path::absolute(&path).map_err(|e| Error::Io(path, e))?;
+    Ok(Verified { path, file })
 }
 
 #[cfg(test)]

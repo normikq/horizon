@@ -101,7 +101,7 @@ fn main() -> ExitCode {
             let frame = player.take_frame();
             let taken = frame.is_some();
             if let Some(frame) = frame {
-                staging.copy_from_slice(&frame);
+                staging.copy_from_slice(&frame.rgba);
             }
             std::hint::black_box(&staging);
             let cost = frame_started.elapsed().as_micros() as u64;

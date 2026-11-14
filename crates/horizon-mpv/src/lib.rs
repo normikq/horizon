@@ -9,18 +9,23 @@
 //!
 //! A [`Player`] plays one local file and renders it with mpv's software
 //! render API on its own thread into RGBA frames ([`Player::take_frame`]),
-//! which the game uploads into an atlas slot. mpv plays the sound itself
-//! through its own audio output.
+//! which the game uploads into an atlas slot. With
+//! [`Options::capture_audio`] mpv writes its sound as 7.1 PCM at
+//! [`SAMPLE_RATE`] into a pipe instead of an audio device, and the game takes
+//! it in step with the picture (`Player::take_audio*`) for its own mixer;
+//! otherwise mpv plays it through its own audio output.
 //!
 //! The bindings are written against mpv's documented client API (`client.h`,
 //! `render.h`, version 2); no mpv code is part of this crate.
 
-pub mod library;
 mod audio_pipe;
+pub mod hooks;
+pub mod library;
 mod player;
 mod sys;
 
-pub use player::{MAX_SIDE, Options, Player, Stats, local_file};
+pub use audio_pipe::SAMPLE_RATE;
+pub use player::{Frame, MAX_SIDE, Options, Player, Stats, local_file};
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -99,6 +104,9 @@ impl std::error::Error for Error {}
 #[derive(Clone)]
 pub struct Mpv {
     api: Arc<sys::Api>,
+    /// The checked file, held open while the library is loaded
+    /// ([`library::Verified`]); none for [`Mpv::open`].
+    _verified: Option<Arc<library::Verified>>,
 }
 
 impl Mpv {
@@ -113,14 +121,27 @@ impl Mpv {
         if version >> 16 != 2 {
             return Err(Error::Version(version));
         }
-        Ok(Self { api: Arc::new(api) })
+        Ok(Self {
+            api: Arc::new(api),
+            _verified: None,
+        })
     }
 
     /// Opens library `name` as the launcher installed it in the game's
     /// version folder `version_dir`, after checking its SHA-256
-    /// ([`library::verified`]).
+    /// ([`library::verified_open`]). The file stays open from the hash to
+    /// the load and after, so the library loaded is the one hashed.
     pub fn open_installed(version_dir: &Path, name: &str) -> Result<Self, Error> {
-        Self::open(&library::verified(version_dir, name)?)
+        let verified = library::verified_open(version_dir, name)?;
+        let mut mpv = Self::open(&verified.path)?;
+        if !verified.still_same() {
+            return Err(Error::Manifest(format!(
+                "{} was replaced while it was loaded",
+                verified.path.display()
+            )));
+        }
+        mpv._verified = Some(Arc::new(verified));
+        Ok(mpv)
     }
 
     /// `mpv_client_api_version()`: (major, minor).

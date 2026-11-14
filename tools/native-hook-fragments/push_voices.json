@@ -1,0 +1,18 @@
+{
+  "hooks": [],
+  "helpers": [
+    {
+      "name": "push_voices",
+      "target": "horizon_client::game::extras::video::Game<'_>::native_push_voices"
+    },
+    {
+      "name": "clear_voices",
+      "target": "horizon_client::game::extras::video::Game<'_>::native_clear_voices"
+    }
+  ],
+  "rust_summary": "several of a mod's audio sources queued together as one multichannel sound, and a source's queue emptied (`native_push_voices`, `native_clear_voices`).",
+  "doc_summary": "`native_push_voices(mod_id, sources, channels, sample_rate, at)` (client, `host.push_voices`) queues one mono block per source under one lock, all or none, so the channels of a multichannel sound (a video's 5.1 speakers) start in the same output buffer and are never refused one at a time; `native_clear_voices(mod_id, sources)` (`host.clear_voices`) drops what those sources have waiting, after a seek. The limits are `native_push_voice`'s. Bundles need \"hooks\": @API:push_voices@.",
+  "comments": [
+    "crates/horizon-client/src/game/extras/video.rs"
+  ]
+}

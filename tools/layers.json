@@ -92,7 +92,6 @@
     "horizon-client -> horizon-hdr",
     "horizon-client -> horizon-mod-api-gen",
     "horizon-client -> horizon-mods",
-    "horizon-client -> horizon-mpv",
     "horizon-client -> horizon-optifine",
     "horizon-client -> horizon-shader-api",
     "horizon-client -> horizon-shaders",
