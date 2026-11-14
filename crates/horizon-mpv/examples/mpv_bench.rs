@@ -1,9 +1,11 @@
 //! Measures what a video frame costs (docs/native-libraries.md, "Frame cost").
 //!
-//! `cargo run --release -p horizon-mpv --example mpv_bench -- <libmpv> [video] [seconds]`
+//! `cargo run --release -p horizon-mpv --example mpv_bench -- <libmpv> [video|-] [seconds] [WxH]`
 //!
-//! Plays `video` (a generated 1280x720, 30 fps test file when none is given)
-//! for `seconds` while a loop stands in for the game's frames at 60 a second.
+//! Plays `video` (`-` or none: a generated 30 fps test file of the surface's
+//! size, one second looped) on a `WxH` surface (1280x720 by default; 3840x2160
+//! for a 4K slot) for `seconds` while a loop stands in for the game's frames
+//! at 60 a second.
 //! Each frame it does what the game's thread does for a video: takes the
 //! newest frame and copies its pixels once, as staging them for the GPU does.
 //! The rendering itself runs on the player's thread and is reported apart.
@@ -13,19 +15,17 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-const WIDTH: u32 = 1280;
-const HEIGHT: u32 = 720;
 const FPS: u32 = 30;
 
-/// `seconds` of moving bars as uncompressed YUV4MPEG2 (4:2:0).
-fn write_video(path: &Path, seconds: u32) -> std::io::Result<()> {
+/// `seconds` of moving bars, `width` x `height`, as uncompressed YUV4MPEG2 (4:2:0).
+fn write_video(path: &Path, seconds: u32, width: u32, height: u32) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::BufWriter::new(std::fs::File::create(path)?);
     writeln!(
         out,
-        "YUV4MPEG2 W{WIDTH} H{HEIGHT} F{FPS}:1 Ip A1:1 C420jpeg"
+        "YUV4MPEG2 W{width} H{height} F{FPS}:1 Ip A1:1 C420jpeg"
     )?;
-    let (w, h) = (WIDTH as usize, HEIGHT as usize);
+    let (w, h) = (width as usize, height as usize);
     let mut luma = vec![0u8; w * h];
     let chroma = vec![128u8; (w / 2) * (h / 2)];
     for frame in 0..(seconds * FPS) as usize {
@@ -64,16 +64,25 @@ fn report(what: &str, mut micros: Vec<u64>) {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(library) = args.first() else {
-        eprintln!("usage: mpv_bench <full path to libmpv> [video] [seconds]");
+        eprintln!("usage: mpv_bench <full path to libmpv> [video|-] [seconds] [WxH]");
         return ExitCode::from(2);
     };
     let seconds: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+    let size = args.get(3).map_or(Some((1280, 720)), |s| {
+        let (w, h) = s.split_once('x')?;
+        Some((w.parse().ok()?, h.parse().ok()?))
+    });
+    let Some((width, height)) = size else {
+        eprintln!("the size is WxH, such as 3840x2160");
+        return ExitCode::from(2);
+    };
     let generated =
         std::env::temp_dir().join(format!("horizon-mpv-bench-{}.y4m", std::process::id()));
-    let video = match args.get(1) {
+    let video = match args.get(1).filter(|a| *a != "-") {
         Some(path) => PathBuf::from(path),
         None => {
-            if let Err(e) = write_video(&generated, seconds) {
+            // One looped second: uncompressed 4K is 12 MB a frame.
+            if let Err(e) = write_video(&generated, 1, width, height) {
                 eprintln!("{}: {e}", generated.display());
                 return ExitCode::FAILURE;
             }
@@ -87,11 +96,11 @@ fn main() -> ExitCode {
             muted: true,
             ..Options::default()
         };
-        let player = mpv.player(WIDTH, HEIGHT, &options)?;
+        let player = mpv.player(width, height, &options)?;
         player.load(&video)?;
 
         let frame_time = Duration::from_micros(16_667);
-        let mut staging = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+        let mut staging = vec![0u8; (width * height * 4) as usize];
         let (mut with_video, mut without, mut render) = (Vec::new(), Vec::new(), Vec::new());
         let mut last_frames = 0;
         let started = Instant::now();
@@ -101,7 +110,9 @@ fn main() -> ExitCode {
             let frame = player.take_frame();
             let taken = frame.is_some();
             if let Some(frame) = frame {
-                staging.copy_from_slice(&frame.rgba);
+                // A smaller video is rendered at its own size, not stretched.
+                let len = frame.rgba.len().min(staging.len());
+                staging[..len].copy_from_slice(&frame.rgba[..len]);
             }
             std::hint::black_box(&staging);
             let cost = frame_started.elapsed().as_micros() as u64;
@@ -116,7 +127,7 @@ fn main() -> ExitCode {
         }
         let elapsed = started.elapsed().as_secs_f64();
         println!(
-            "{WIDTH}x{HEIGHT}, {} frames rendered in {elapsed:.1} s ({:.1} a second), video {:?}",
+            "{width}x{height}, {} frames rendered in {elapsed:.1} s ({:.1} a second), video {:?}",
             last_frames,
             last_frames as f64 / elapsed,
             player.video_size()

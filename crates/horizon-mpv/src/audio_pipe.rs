@@ -31,7 +31,12 @@ const FRAME_BYTES: usize = 8 * 4;
 /// A sample that is not silence, for telling a surround file from stereo.
 const AUDIBLE: f32 = 1e-4;
 /// The synthetic subwoofer's low-pass corner when a stereo file is upmixed, in hertz.
+#[cfg(test)]
 const LFE_CUTOFF: f32 = 120.0;
+/// The one-pole low-pass coefficient of the synthetic subwoofer: a 120 Hz corner
+/// at [`SAMPLE_RATE`], `1 - exp(-2π · 120 / rate)`, worked out here once rather
+/// than per sample (`exp` is not a `const fn`; a test checks the value).
+const LFE_ALPHA: f32 = 0.015_585_237;
 /// -3 dB, the usual centre and surround weight of an up- or downmix.
 const MINUS_3DB: f32 = std::f32::consts::FRAC_1_SQRT_2;
 /// How far the reader lets mpv's sound run ahead of the wall clock, in seconds.
@@ -183,8 +188,7 @@ impl AudioBuffer {
             return frame;
         }
         let [fl, fr, ..] = frame;
-        let alpha = 1.0 - (-2.0 * std::f32::consts::PI * LFE_CUTOFF / SAMPLE_RATE as f32).exp();
-        self.lfe += alpha * ((fl + fr) * 0.5 - self.lfe);
+        self.lfe += LFE_ALPHA * ((fl + fr) * 0.5 - self.lfe);
         let side = (fl - fr) * 0.6;
         [
             fl,
@@ -834,6 +838,12 @@ mod tests {
             out51[5][0],
             (0.8 + 0.6 * FRAC_1_SQRT_2).clamp(-1.0, 1.0)
         ));
+    }
+
+    #[test]
+    fn the_lfe_coefficient_is_its_cutoffs() {
+        let alpha = 1.0 - (-2.0 * std::f32::consts::PI * LFE_CUTOFF / SAMPLE_RATE as f32).exp();
+        assert!((LFE_ALPHA - alpha).abs() < 1e-7, "{LFE_ALPHA} vs {alpha}");
     }
 
     #[test]

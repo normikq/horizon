@@ -211,6 +211,21 @@ Measured with `mpv_bench` ([Trying it](#trying-it)) on an Intel Core i5-14600KF,
 GPU staging. It is one computer: the number that counts on a slower one is `upload_micros` below, read in the
 game.
 
+Larger surfaces, measured the same way on another Windows 11 computer (`mpv_bench -- <libmpv> - 10 WxH`, a
+generated file of the surface's size, release build). mpv kept 30 frames a second at every size; the cost is the
+game's thread taking and copying the frame, which grows with its bytes (8.3 MB at 1080p, 33 MB at 4K):
+
+| Surface | Mean | Median | 99% | Worst |
+|---|---|---|---|---|
+| 1280x720 | 0.47 ms | 0.41 ms | 0.87 ms | 1.03 ms |
+| 1920x1080 | 1.64 ms | 1.43 ms | 5.01 ms | 5.76 ms |
+| 3840x2160 | 3.80 ms | 3.28 ms | 8.63 ms | 9.29 ms |
+
+A 4K video is past the 2 ms target, on each of its 30 frames a second: at 60 frames a second of the game,
+every other frame pays about 4 ms, up to 9. Only a 4K file pays it: a smaller file on a 4K surface is rendered
+at its own size, never stretched. The generated file needs no decoding, so a real file adds mpv's decoding,
+on its own threads.
+
 The same video in the game itself (the `video_screen` example, a creative world at 1280x720, RTX 5070 Ti):
 taking the frame costs 1 microsecond and staging its patch 0.34 to 0.36 ms of the game's thread, for each of
 the 30 video frames a second.
