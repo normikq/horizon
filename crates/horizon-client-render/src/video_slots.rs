@@ -10,11 +10,11 @@ use crate::hud::{MOD_IMAGE_SIZE, MOD_IMAGE_SPRITE};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
-/// How many videos play at once. Each slot costs 3.5 MiB of atlas.
+/// How many videos play at once. Each slot costs ~33 MiB of atlas at 4K.
 pub const VIDEO_SLOTS: usize = 2;
-/// A video frame's largest size: 1080p (Full HD native).
-pub const VIDEO_WIDTH: u32 = 1920;
-pub const VIDEO_HEIGHT: u32 = 1080;
+/// A video frame's largest size: 4K UHD (3840x2160).
+pub const VIDEO_WIDTH: u32 = 3840;
+pub const VIDEO_HEIGHT: u32 = 2160;
 
 /// The atlas sprite of video slot `slot` (`horizon/video{slot}`).
 pub fn video_slot_sprite(slot: usize) -> Option<&'static str> {
