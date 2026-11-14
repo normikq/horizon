@@ -294,9 +294,9 @@ target/fast/examples/video_screen --resources PATH --game-dir SCRATCH --world Vi
   that reviewed first. `horizon-mpv` is written against mpv's documented client API, whose headers are ISC, and
   contains no mpv code.
 - **Platforms.** Built and tested on Windows x64. The loader and the sound's FIFO have a Unix path, untested.
-- **Renderer.** Frames come from mpv's software renderer and reach the GPU as a texture patch. A zero-copy path
-  through mpv's OpenGL or D3D11 renderer would need the engine to share a device with mpv, which wgpu does not
-  offer today.
+- **Renderer.** Frames come from mpv's software renderer and reach each video's own GPU texture through a
+  background-filled staging buffer. A zero-copy path through mpv's OpenGL or D3D11 renderer would need the
+  engine to share a device with mpv, which wgpu does not offer today.
 - **Hardware decoding** uses copy-back only (`hwdec=auto-copy-safe`): the software renderer needs frames in
   system memory, and copy-back hands them there. A libmpv that does not know that value decodes in software.
 - **Where videos come from.** Local files only. Streams would need a list of allowed protocols, a setting and a
